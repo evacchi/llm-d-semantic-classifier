@@ -153,6 +153,19 @@ impl<R: ClassifierRuntime + Send + Sync + 'static> InferenceExecutor<R> {
                                     guard.blocking_recv()
                                 };
                                 let Some(job) = job else { return };
+                                // The handler owns the oneshot receiver. If it
+                                // was cancelled (for example because the
+                                // caller disconnected or its gRPC timeout
+                                // elapsed), there is no useful result to send.
+                                // Drop the queued job before invoking the
+                                // classifier so cancelled work does not spend
+                                // model time. Dropping the job also releases
+                                // its admission permit.
+                                if job.respond.is_closed() {
+                                    current.fetch_sub(1, Ordering::SeqCst);
+                                    drop(job);
+                                    continue;
+                                }
                                 metrics.record_stage(LatencyStage::Queue, job.queued_at.elapsed());
                                 let result = service.classify(job.input);
                                 let _ = job.respond.send(result);
