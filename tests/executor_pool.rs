@@ -261,3 +261,58 @@ fn i092_cancelled_queued_job_is_skipped_and_capacity_recovers() {
         "the cancelled queued job must not invoke the classifier"
     );
 }
+
+#[test]
+fn i093_expired_queued_job_is_skipped_and_reports_deadline() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let first_started = Arc::new(Barrier::new(2));
+    let release_first = Arc::new(Barrier::new(2));
+    let classifier = CancellationClassifier {
+        calls: calls.clone(),
+        first_started: first_started.clone(),
+        release_first: release_first.clone(),
+    };
+    let executor = InferenceExecutor::spawn_with_workers(classifier, Metrics::new(), 2, 1);
+
+    let first = executor
+        .try_enqueue(ClassificationInput {
+            text: "blocking".into(),
+            requested_signals: vec!["sensitivity".into()],
+            session_metadata: Default::default(),
+        })
+        .expect("first job must be admitted");
+    first_started.wait();
+
+    let expired = executor
+        .try_enqueue_with_deadline(
+            ClassificationInput {
+                text: "expired".into(),
+                requested_signals: vec!["sensitivity".into()],
+                session_metadata: Default::default(),
+            },
+            Some(Instant::now() - Duration::from_millis(1)),
+        )
+        .expect("expired job must be admitted before the worker checks it");
+
+    release_first.wait();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    rt.block_on(first)
+        .expect("first job must receive a response")
+        .expect("first forward must succeed");
+    let result = rt
+        .block_on(expired)
+        .expect("expired job must receive a result");
+
+    assert!(
+        matches!(result, Err(ClassifyError::RequestExpired)),
+        "expired queued work must return RequestExpired, got {result:?}"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the expired queued job must not invoke the classifier"
+    );
+}

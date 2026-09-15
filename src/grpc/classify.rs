@@ -22,6 +22,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::classify::ClassifyError;
 use crate::handoff::InferenceExecutor;
@@ -42,6 +43,42 @@ pub mod generated {
 }
 
 pub use generated::{ClassifyRequest, ClassifyResponse};
+
+#[derive(Clone, Copy)]
+struct RequestDeadline(Instant);
+
+fn request_deadline<T>(request: &tonic::Request<T>) -> Option<Instant> {
+    if let Some(deadline) = request.extensions().get::<RequestDeadline>() {
+        return Some(deadline.0);
+    }
+
+    request
+        .metadata()
+        .get("grpc-timeout")
+        .and_then(|value| value.to_str().ok())
+        .and_then(parse_grpc_timeout)
+        .and_then(|timeout| Instant::now().checked_add(timeout))
+}
+
+fn parse_grpc_timeout(value: &str) -> Option<Duration> {
+    if value.len() < 2 {
+        return None;
+    }
+    let (number, unit) = value.split_at(value.len() - 1);
+    if number.is_empty() || number.len() > 8 {
+        return None;
+    }
+    let value = number.parse::<u64>().ok()?;
+    match unit {
+        "H" => Some(Duration::from_secs(value.checked_mul(60 * 60)?)),
+        "M" => Some(Duration::from_secs(value.checked_mul(60)?)),
+        "S" => Some(Duration::from_secs(value)),
+        "m" => Some(Duration::from_millis(value)),
+        "u" => Some(Duration::from_micros(value)),
+        "n" => Some(Duration::from_nanos(value)),
+        _ => None,
+    }
+}
 
 /// The generated tonic (async) service trait.
 pub use generated::classify_server::Classify as ClassifyTrait;
@@ -149,6 +186,7 @@ where
         &self,
         request: tonic::Request<generated::ClassifyRequest>,
     ) -> Result<tonic::Response<generated::ClassifyResponse>, tonic::Status> {
+        let deadline = request_deadline(&request);
         let req = request.into_inner();
         // AC-014: record request telemetry with the context/session hashed, so
         // default telemetry and trace capture never carry raw prompt/session text.
@@ -190,7 +228,7 @@ where
         // resource_exhausted (never unboundedly buffered).
         let respond = self
             .executor
-            .try_enqueue(input)
+            .try_enqueue_with_deadline(input, deadline)
             .map_err(|_| tonic::Status::resource_exhausted("inference queue is full"))?;
         // Await the dedicated executor's forward result (returned via oneshot).
         let result = respond
@@ -206,6 +244,9 @@ where
                 return Err(match e {
                     ClassifyError::ResourceExhausted => {
                         tonic::Status::resource_exhausted("inference queue is full")
+                    }
+                    ClassifyError::RequestExpired => {
+                        tonic::Status::deadline_exceeded("request deadline expired")
                     }
                     _ => tonic::Status::unavailable(e.to_string()),
                 })
@@ -482,5 +523,28 @@ impl ClassifyClient {
         let mut client = generated::classify_client::ClassifyClient::new(self.channel.clone());
         let response = self.runtime.block_on(client.classify(request))?;
         Ok(response.into_inner())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_grpc_timeout;
+    use std::time::Duration;
+
+    #[test]
+    fn parses_grpc_timeout_units() {
+        assert_eq!(parse_grpc_timeout("1S"), Some(Duration::from_secs(1)));
+        assert_eq!(parse_grpc_timeout("250m"), Some(Duration::from_millis(250)));
+        assert_eq!(parse_grpc_timeout("10u"), Some(Duration::from_micros(10)));
+        assert_eq!(parse_grpc_timeout("10n"), Some(Duration::from_nanos(10)));
+    }
+
+    #[test]
+    fn rejects_invalid_grpc_timeout_values() {
+        assert_eq!(parse_grpc_timeout(""), None);
+        assert_eq!(parse_grpc_timeout("1"), None);
+        assert_eq!(parse_grpc_timeout("1x"), None);
+        assert_eq!(parse_grpc_timeout("123456789S"), None);
+        assert_eq!(parse_grpc_timeout("abcS"), None);
     }
 }
