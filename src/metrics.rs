@@ -142,6 +142,10 @@ pub struct MetricsSnapshot {
     /// Number of classification requests that waited for another thread's
     /// in-flight forward (single-flight coalesced, AC-007).
     pub cache_coalesced: u64,
+    /// Number of queued jobs discarded after their deadline elapsed.
+    pub queued_expired: u64,
+    /// Number of queued jobs discarded after their caller cancelled.
+    pub queued_cancelled: u64,
 }
 
 /// The shared latency/counter registry behind the metrics surface.
@@ -163,6 +167,8 @@ struct Inner {
     cache_hits: u64,
     cache_misses: u64,
     cache_coalesced: u64,
+    queued_expired: u64,
+    queued_cancelled: u64,
     hist_queue: Histogram,
     hist_tokenize: Histogram,
     hist_forward: Histogram,
@@ -229,6 +235,16 @@ impl Metrics {
         self.inner.lock().unwrap().cache_coalesced += 1;
     }
 
+    /// Record one queued job discarded after its deadline elapsed.
+    pub fn record_queued_expired(&self) {
+        self.inner.lock().unwrap().queued_expired += 1;
+    }
+
+    /// Record one queued job discarded after its caller cancelled.
+    pub fn record_queued_cancelled(&self) {
+        self.inner.lock().unwrap().queued_cancelled += 1;
+    }
+
     /// An immutable snapshot of the accumulated latency decomposition.
     pub fn snapshot(&self) -> MetricsSnapshot {
         let inner = self.inner.lock().unwrap();
@@ -240,6 +256,8 @@ impl Metrics {
             cache_hits: inner.cache_hits,
             cache_misses: inner.cache_misses,
             cache_coalesced: inner.cache_coalesced,
+            queued_expired: inner.queued_expired,
+            queued_cancelled: inner.queued_cancelled,
         }
     }
 }
@@ -395,5 +413,17 @@ mod tests {
             snap.cache_hits + snap.cache_misses + snap.cache_coalesced,
             6
         );
+    }
+
+    #[test]
+    fn u082_queued_discard_counters_are_separate() {
+        let metrics = Metrics::new();
+        metrics.record_queued_expired();
+        metrics.record_queued_expired();
+        metrics.record_queued_cancelled();
+
+        let snap = metrics.snapshot();
+        assert_eq!(snap.queued_expired, 2);
+        assert_eq!(snap.queued_cancelled, 1);
     }
 }

@@ -204,7 +204,8 @@ fn i092_cancelled_queued_job_is_skipped_and_capacity_recovers() {
         first_started: first_started.clone(),
         release_first: release_first.clone(),
     };
-    let executor = InferenceExecutor::spawn_with_workers(classifier, Metrics::new(), 2, 1);
+    let metrics = Metrics::new();
+    let executor = InferenceExecutor::spawn_with_workers(classifier, metrics.clone(), 2, 1);
 
     let first = executor
         .try_enqueue(ClassificationInput {
@@ -260,6 +261,9 @@ fn i092_cancelled_queued_job_is_skipped_and_capacity_recovers() {
         2,
         "the cancelled queued job must not invoke the classifier"
     );
+    let snapshot = metrics.snapshot();
+    assert_eq!(snapshot.queued_cancelled, 1);
+    assert_eq!(snapshot.queued_expired, 0);
 }
 
 #[test]
@@ -272,7 +276,8 @@ fn i093_expired_queued_job_is_skipped_and_reports_deadline() {
         first_started: first_started.clone(),
         release_first: release_first.clone(),
     };
-    let executor = InferenceExecutor::spawn_with_workers(classifier, Metrics::new(), 2, 1);
+    let metrics = Metrics::new();
+    let executor = InferenceExecutor::spawn_with_workers(classifier, metrics.clone(), 2, 1);
 
     let first = executor
         .try_enqueue(ClassificationInput {
@@ -315,4 +320,7 @@ fn i093_expired_queued_job_is_skipped_and_reports_deadline() {
         1,
         "the expired queued job must not invoke the classifier"
     );
+    let snapshot = metrics.snapshot();
+    assert_eq!(snapshot.queued_expired, 1);
+    assert_eq!(snapshot.queued_cancelled, 0);
 }

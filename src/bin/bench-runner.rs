@@ -263,6 +263,10 @@ fn stage_delta(before: MetricsSnapshot, after: MetricsSnapshot) -> MetricsSnapsh
         cache_hits: after.cache_hits.saturating_sub(before.cache_hits),
         cache_misses: after.cache_misses.saturating_sub(before.cache_misses),
         cache_coalesced: after.cache_coalesced.saturating_sub(before.cache_coalesced),
+        queued_expired: after.queued_expired.saturating_sub(before.queued_expired),
+        queued_cancelled: after
+            .queued_cancelled
+            .saturating_sub(before.queued_cancelled),
     }
 }
 

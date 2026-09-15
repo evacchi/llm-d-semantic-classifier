@@ -155,6 +155,9 @@ impl<R: ClassifierRuntime + Send + Sync + 'static> InferenceExecutor<R> {
                                     guard.blocking_recv()
                                 };
                                 let Some(job) = job else { return };
+                                let expired = job
+                                    .deadline
+                                    .is_some_and(|deadline| std::time::Instant::now() >= deadline);
                                 // The handler owns the oneshot receiver. If it
                                 // was cancelled (for example because the
                                 // caller disconnected or its gRPC timeout
@@ -165,14 +168,17 @@ impl<R: ClassifierRuntime + Send + Sync + 'static> InferenceExecutor<R> {
                                 // its admission permit.
                                 if job.respond.is_closed() {
                                     current.fetch_sub(1, Ordering::SeqCst);
+                                    if expired {
+                                        metrics.record_queued_expired();
+                                    } else {
+                                        metrics.record_queued_cancelled();
+                                    }
                                     drop(job);
                                     continue;
                                 }
-                                if job
-                                    .deadline
-                                    .is_some_and(|deadline| std::time::Instant::now() >= deadline)
-                                {
+                                if expired {
                                     current.fetch_sub(1, Ordering::SeqCst);
+                                    metrics.record_queued_expired();
                                     let _ = job.respond.send(Err(ClassifyError::RequestExpired));
                                     continue;
                                 }
