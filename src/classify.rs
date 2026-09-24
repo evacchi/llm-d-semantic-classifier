@@ -583,9 +583,11 @@ impl CandleClassifier {
         // classifier's identity. It was previously computed during warmup and
         // then discarded, so the provenance it was meant to provide never
         // reached a result or a cache key.
-        let digest =
-            crate::runtime::modelcar_digest(model_dir, crate::runtime::MODELCAR_REQUIRED_FILES)
-                .ok();
+        let digest = crate::runtime::modelcar_digest(
+            model_dir,
+            crate::runtime::modelcar_required_files(model_dir),
+        )
+        .ok();
         CandleClassifier::with_taxonomy_and_digest(embedder, definition, Metrics::new(), digest)
     }
 }
@@ -731,7 +733,10 @@ pub fn load_and_warm_modelcar<P: AsRef<std::path::Path>>(
     // before any load.
     let mut runtime = crate::runtime::Runtime::new();
     runtime
-        .warmup_modelcar(model_dir, crate::runtime::MODELCAR_REQUIRED_FILES)
+        .warmup_modelcar(
+            model_dir,
+            crate::runtime::modelcar_required_files(model_dir),
+        )
         .map_err(ClassifyError::Unavailable)?;
     // (2) Load tokenizer + config + safetensors and build the real classifier.
     let classifier = CandleClassifier::from_modelcar(model_dir)?;
