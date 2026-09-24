@@ -51,7 +51,7 @@ acceptance criterion, every required test ID, and its execution status.
 
 | Gap | Impact | Phase |
 | --- | --- | --- |
-| No cluster evidence | sidecar and Service round trips, same-node versus cross-node placement, disconnected artifact start, restricted security context, and restart behaviour are unmeasured | 0.3 |
+| Same-node versus cross-node placement | remains unmeasured; the other cluster checks are covered by [`hack/cluster-evidence`](../hack/cluster-evidence) | 0.3 |
 | Benchmarks are single-environment | all published numbers come from one contributor's homelab and have not been independently reproduced. See [performance.md](performance.md) | ongoing |
 | Behaviour under pod CPU limits unknown | published numbers are from an unconstrained host and will not transfer directly | 0.21 |
 
