@@ -439,8 +439,21 @@ impl SemanticCache for NoopSemanticCache {
 
 /// Build the L2 isolation tag from a cache-identity tuple (same fields as the
 /// blake3 L1 key), pipe-separated so field boundaries cannot alias.
-pub fn identity_tag(id: (&str, &str, &str, &str)) -> String {
-    format!("{}|{}|{}|{}", id.0, id.1, id.2, id.3)
+///
+/// The artifact digest is a fifth, OPTIONAL field and is appended only when
+/// present, mirroring how the L1 key hashes it. That is what keeps the two
+/// tiers in step: L1 now isolates by loaded-artifact digest, so an L2 tag that
+/// ignored it would let a digest change with an UNCHANGED revision serve a
+/// stale semantic label from L2 while L1 correctly missed -- reintroducing, one
+/// tier down, exactly the aliasing the digest was added to prevent.
+///
+/// `None` emits the original four-field tag, so identities without a digest
+/// keep their previous value and no existing L2 entry is orphaned.
+pub fn identity_tag(id: (&str, &str, &str, &str, Option<&str>)) -> String {
+    match id.4 {
+        Some(digest) => format!("{}|{}|{}|{}|{}", id.0, id.1, id.2, id.3, digest),
+        None => format!("{}|{}|{}|{}", id.0, id.1, id.2, id.3),
+    }
 }
 
 #[cfg(test)]
@@ -773,10 +786,39 @@ mod semantic_tests {
 
     #[test]
     fn identity_tag_is_stable_and_field_separated() {
-        assert_eq!(identity_tag(("c", "m", "t", "x")), "c|m|t|x");
+        assert_eq!(identity_tag(("c", "m", "t", "x", None)), "c|m|t|x");
         assert_ne!(
-            identity_tag(("a", "bc", "d", "e")),
-            identity_tag(("ab", "c", "d", "e"))
+            identity_tag(("a", "bc", "d", "e", None)),
+            identity_tag(("ab", "c", "d", "e", None))
         );
+    }
+
+    /// The L2 tag must isolate on the loaded artifact digest exactly as the L1
+    /// blake3 key does. If it did not, a rebuilt artifact under an UNCHANGED
+    /// revision would miss in L1 and then HIT in L2, serving a semantic label
+    /// computed by the previous model -- the aliasing the digest exists to
+    /// prevent, reintroduced one tier down.
+    #[test]
+    fn identity_tag_isolates_on_artifact_digest() {
+        let a = identity_tag(("c", "m", "t", "x", Some("sha256:aaa")));
+        let b = identity_tag(("c", "m", "t", "x", Some("sha256:bbb")));
+        assert_ne!(
+            a, b,
+            "same revision, different artifact must not share an L2 tag"
+        );
+
+        // None keeps the historical four-field tag, so identities without a
+        // recorded digest are not orphaned from their existing L2 entries.
+        assert_eq!(identity_tag(("c", "m", "t", "x", None)), "c|m|t|x");
+        assert_ne!(identity_tag(("c", "m", "t", "x", Some("d"))), "c|m|t|x");
+
+        // NOT asserted here: that a pipe INSIDE a field cannot alias. It can,
+        // and it could before the digest was added --
+        //     ("a","b","c|d","e") and ("a","b","c","d|e") both render "a|b|c|d|e".
+        // L1 does not have this problem because update_field length-prefixes
+        // every field; the L2 tag only separates them. Fixing it changes the
+        // tag format and orphans existing L2 entries, so it is left as a
+        // separate change rather than folded into this one. Left undisturbed,
+        // not endorsed.
     }
 }
