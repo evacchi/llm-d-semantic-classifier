@@ -263,6 +263,9 @@ fn load_classifier(name: &str, model_dir: &str) -> std::io::Result<Classifier> {
         session_id: "playground".to_string(),
         context: "llm-d-sc playground warmup probe".to_string(),
         signals: Vec::new(),
+        // UNSPECIFIED: a warmup probe carries no conversation, so it asserts
+        // nothing about completeness. Matches dummy_gateway and gateway-probe.
+        context_completeness: Default::default(),
     });
     let labels = warm
         .map(|r| r.ranked.into_iter().map(|s| s.label).collect())
@@ -303,6 +306,8 @@ fn handle_classify(
         context: text,
         // Empty = no signal constraint, so this works against any served taxonomy.
         signals: Vec::new(),
+        // UNSPECIFIED: the playground sends whole prompts, never deltas.
+        context_completeness: Default::default(),
     };
 
     let before = entry.server.metrics_snapshot();
