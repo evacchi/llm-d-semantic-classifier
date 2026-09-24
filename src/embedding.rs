@@ -17,7 +17,7 @@ use std::path::Path;
 
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
-use candle_transformers::models::bert;
+use candle_transformers::models::{bert, modernbert};
 use serde_json::Value;
 
 use crate::tokenizer::Tokenizer;
@@ -86,11 +86,140 @@ impl EmbeddingContract {
 /// A resident embedder: the real Candle forward over the pinned sensitivity
 /// BERT model, tokenized by the resident [`Tokenizer`].
 ///
+/// Which encoder architecture a ModelCar declares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackboneKind {
+    Bert,
+    ModernBert,
+}
+
+/// A loaded encoder backbone.
+///
+/// llm-d-sc served exactly one architecture (BERT) until ModernBERT ModelCars
+/// appeared -- the Vela family (llm-semantic-router/Vela-1.0-Encoder-307M*) is
+/// ModernBERT, and its config does not even deserialize into `bert::Config`.
+///
+/// Dispatch is on the config's `model_type`, the field the HF ecosystem already
+/// uses to select an architecture. Sniffing tensor names would be worse than
+/// useless here: the two architectures share many names, so a mis-detection
+/// would load, run, and emit silently wrong embeddings -- the failure shape this
+/// project has already been bitten by once, where argmax survived a broken
+/// transform and only calibration revealed it.
+pub enum Backbone {
+    Bert(Box<bert::BertModel>),
+    ModernBert(Box<modernbert::ModernBert>),
+}
+
+/// A parsed-but-not-yet-loaded ModelCar config.
+pub enum BackboneConfig {
+    Bert(Box<bert::Config>),
+    ModernBert(Box<modernbert::Config>),
+}
+
+impl BackboneConfig {
+    pub fn kind(&self) -> BackboneKind {
+        match self {
+            BackboneConfig::Bert(_) => BackboneKind::Bert,
+            BackboneConfig::ModernBert(_) => BackboneKind::ModernBert,
+        }
+    }
+
+    pub fn hidden_size(&self) -> usize {
+        match self {
+            BackboneConfig::Bert(c) => c.hidden_size,
+            BackboneConfig::ModernBert(c) => c.hidden_size,
+        }
+    }
+}
+
+impl Backbone {
+    /// Parse a ModelCar `config.json` into the architecture it declares.
+    ///
+    /// A missing `model_type` is BERT: every ModelCar published before
+    /// ModernBERT support omits it, and rejecting them would break every
+    /// deployed classifier. An UNKNOWN `model_type` is an error rather than a
+    /// fallback -- silently loading the wrong backbone is the one outcome worse
+    /// than refusing to start.
+    pub fn parse_config(raw: &str) -> Result<BackboneConfig, EmbeddingError> {
+        #[derive(serde::Deserialize)]
+        struct Probe {
+            #[serde(default)]
+            model_type: Option<String>,
+        }
+        let probe: Probe = serde_json::from_str(raw).map_err(EmbeddingError::Json)?;
+        match probe.model_type.as_deref() {
+            None | Some("bert") => Ok(BackboneConfig::Bert(Box::new(
+                serde_json::from_str(raw).map_err(EmbeddingError::Json)?,
+            ))),
+            Some("modernbert") => Ok(BackboneConfig::ModernBert(Box::new(
+                serde_json::from_str(raw).map_err(EmbeddingError::Json)?,
+            ))),
+            Some(_) => Err(EmbeddingError::MissingField(
+                "unsupported model_type; llm-d-sc serves bert and modernbert",
+            )),
+        }
+    }
+
+    fn load(vb: VarBuilder, config: &BackboneConfig) -> Result<Backbone, EmbeddingError> {
+        match config {
+            BackboneConfig::Bert(c) => Ok(Backbone::Bert(Box::new(
+                bert::BertModel::load(vb, c).map_err(EmbeddingError::Candle)?,
+            ))),
+            BackboneConfig::ModernBert(c) => Ok(Backbone::ModernBert(Box::new(
+                modernbert::ModernBert::load(vb, c).map_err(EmbeddingError::Candle)?,
+            ))),
+        }
+    }
+
+    pub fn kind(&self) -> BackboneKind {
+        match self {
+            Backbone::Bert(_) => BackboneKind::Bert,
+            Backbone::ModernBert(_) => BackboneKind::ModernBert,
+        }
+    }
+
+    fn device(&self) -> &Device {
+        match self {
+            Backbone::Bert(m) => &m.device,
+            // ModernBert does not expose a device handle; this crate is CPU-only
+            // (no cuda feature on candle-core), so the device is known.
+            Backbone::ModernBert(_) => &Device::Cpu,
+        }
+    }
+
+    /// Run the encoder forward, returning the per-token hidden states.
+    ///
+    /// BERT takes token_type_ids; ModernBERT has no segment embedding and takes
+    /// the attention mask directly. The mask dtype also differs -- ModernBERT
+    /// multiplies it into attention scores, so it must be float, not u32.
+    fn forward(
+        &self,
+        input_ids: &Tensor,
+        attention_mask: &Tensor,
+    ) -> Result<Tensor, EmbeddingError> {
+        match self {
+            Backbone::Bert(m) => {
+                let seq = input_ids.dims2().map_err(EmbeddingError::Candle)?;
+                let token_type_ids = Tensor::zeros(seq, DType::U32, self.device())
+                    .map_err(EmbeddingError::Candle)?;
+                m.forward(input_ids, &token_type_ids, Some(attention_mask))
+                    .map_err(EmbeddingError::Candle)
+            }
+            Backbone::ModernBert(m) => {
+                let mask = attention_mask
+                    .to_dtype(DType::F32)
+                    .map_err(EmbeddingError::Candle)?;
+                m.forward(input_ids, &mask).map_err(EmbeddingError::Candle)
+            }
+        }
+    }
+}
+
 /// The model weights are memory-mapped from a local `model.safetensors` (never
 /// fetched at runtime) and run on the CPU in eval mode (dropout disabled), so
 /// repeated embeddings of the same input are deterministic.
 pub struct Embedder {
-    model: bert::BertModel,
+    model: Backbone,
     tokenizer: Tokenizer,
 }
 
@@ -104,7 +233,7 @@ impl Embedder {
         pooling_config: P,
     ) -> Result<Embedder, EmbeddingError> {
         let raw = fs::read_to_string(model_config).map_err(EmbeddingError::Io)?;
-        let config: bert::Config = serde_json::from_str(&raw).map_err(EmbeddingError::Json)?;
+        let config = Backbone::parse_config(&raw)?;
 
         let device = Device::Cpu;
         // SAFETY: `from_mmaped_safetensors` memory-maps the safetensors file.
@@ -115,16 +244,26 @@ impl Embedder {
             VarBuilder::from_mmaped_safetensors(&[weights.as_ref()], DType::F32, &device)
         }
         .map_err(EmbeddingError::Candle)?;
-        let model = bert::BertModel::load(vb, &config).map_err(EmbeddingError::Candle)?;
+        let model = Backbone::load(vb, &config)?;
 
         let tokenizer = Tokenizer::load(tokenizer_path).map_err(EmbeddingError::Tokenizer)?;
         // The pooling config pins the expected embedding dimension; validate it
-        // matches the bert hidden_size so the forward emits the contracted dim.
-        let contract = EmbeddingContract::load(pooling_config)?;
-        if contract.dimension() != config.hidden_size {
-            return Err(EmbeddingError::MissingField(
-                "word_embedding_dimension != hidden_size",
-            ));
+        // matches the backbone hidden_size so the forward emits the contracted
+        // dim. ModernBERT ModelCars (the Vela family) ship no
+        // sentence-transformers module stack and therefore no pooling config --
+        // there the dimension is taken from the backbone itself and the check is
+        // vacuous, which is honest: there is no second declaration to agree with.
+        //
+        // A pooling config that EXISTS is still checked. Only absence is
+        // tolerated, so a BERT ModelCar with a contradictory pooling config
+        // still fails exactly as before.
+        if pooling_config.as_ref().exists() {
+            let contract = EmbeddingContract::load(pooling_config)?;
+            if contract.dimension() != config.hidden_size() {
+                return Err(EmbeddingError::MissingField(
+                    "word_embedding_dimension != hidden_size",
+                ));
+            }
         }
 
         Ok(Embedder { model, tokenizer })
@@ -143,19 +282,14 @@ impl Embedder {
     /// final embedding vector.
     pub fn embed_ids(&self, ids: Vec<u32>) -> Result<Vec<f32>, EmbeddingError> {
         let seq_len = ids.len();
-        let device = &self.model.device;
+        let device = self.model.device();
 
         let input_ids =
             Tensor::from_vec(ids, (1, seq_len), device).map_err(EmbeddingError::Candle)?;
-        let token_type_ids =
-            Tensor::zeros((1, seq_len), DType::U32, device).map_err(EmbeddingError::Candle)?;
         let attention_mask =
             Tensor::ones((1, seq_len), DType::U32, device).map_err(EmbeddingError::Candle)?;
 
-        let sequence = self
-            .model
-            .forward(&input_ids, &token_type_ids, Some(&attention_mask))
-            .map_err(EmbeddingError::Candle)?;
+        let sequence = self.model.forward(&input_ids, &attention_mask)?;
 
         let pooled = mean_pool(&sequence, &attention_mask).map_err(EmbeddingError::Candle)?;
         let flat = pooled.squeeze(0).map_err(EmbeddingError::Candle)?;
@@ -193,6 +327,80 @@ mod tests {
     use super::*;
 
     const GOLDEN_INPUT: &str = "this is a golden sensitivity input";
+
+    /// Vela (llm-semantic-router/Vela-1.0-Encoder-307M*) is ModernBERT, not
+    /// BERT. The Embedder hardcoded `bert::Config`/`bert::BertModel`, so a
+    /// ModernBERT ModelCar could not load at all -- serde rejects the config
+    /// before any weight is touched, because ModernBERT has no
+    /// `type_vocab_size` and carries fields BERT's Config does not model.
+    ///
+    /// Detection is on `model_type`, the field the HF ecosystem already uses to
+    /// pick an architecture, rather than on sniffing tensor names: a
+    /// mis-detected backbone would still load many shared tensors and then emit
+    /// silently wrong embeddings, which is the failure mode this project can
+    /// least afford (see the cosine-similarity normalisation incident).
+    #[test]
+    fn u070_modernbert_config_is_detected_and_accepted() {
+        let vela = r#"{
+          "model_type": "modernbert",
+          "architectures": ["ModernBertForSequenceClassification"],
+          "vocab_size": 256000, "hidden_size": 768, "num_hidden_layers": 22,
+          "num_attention_heads": 12, "intermediate_size": 1152,
+          "max_position_embeddings": 32768, "layer_norm_eps": 1e-5,
+          "pad_token_id": 1, "global_attn_every_n_layers": 3,
+          "global_rope_theta": 160000.0, "local_attention": 128,
+          "local_rope_theta": 10000.0
+        }"#;
+        let parsed = Backbone::parse_config(vela).expect("ModernBERT config must parse");
+        assert_eq!(parsed.kind(), BackboneKind::ModernBert);
+        assert_eq!(parsed.hidden_size(), 768);
+    }
+
+    /// The existing BERT path must keep working unchanged -- detection must not
+    /// regress every classifier already deployed.
+    #[test]
+    fn u071_bert_config_still_detected() {
+        let bert = r#"{
+          "model_type": "bert", "vocab_size": 30522, "hidden_size": 384,
+          "num_hidden_layers": 6, "num_attention_heads": 12,
+          "intermediate_size": 1536, "max_position_embeddings": 512,
+          "type_vocab_size": 2, "layer_norm_eps": 1e-12,
+          "hidden_act": "gelu", "hidden_dropout_prob": 0.1,
+          "initializer_range": 0.02, "pad_token_id": 0,
+          "classifier_dropout": null
+        }"#;
+        let parsed = Backbone::parse_config(bert).expect("BERT config must parse");
+        assert_eq!(parsed.kind(), BackboneKind::Bert);
+        assert_eq!(parsed.hidden_size(), 384);
+    }
+
+    /// A config with no `model_type` must be treated as BERT, not rejected:
+    /// every ModelCar published before this change omits it.
+    #[test]
+    fn u072_missing_model_type_defaults_to_bert() {
+        let legacy = r#"{
+          "vocab_size": 30522, "hidden_size": 384,
+          "num_hidden_layers": 6, "num_attention_heads": 12,
+          "intermediate_size": 1536, "max_position_embeddings": 512,
+          "type_vocab_size": 2, "layer_norm_eps": 1e-12,
+          "hidden_act": "gelu", "hidden_dropout_prob": 0.1,
+          "initializer_range": 0.02, "pad_token_id": 0,
+          "classifier_dropout": null
+        }"#;
+        let parsed = Backbone::parse_config(legacy).expect("legacy config must parse");
+        assert_eq!(parsed.kind(), BackboneKind::Bert);
+    }
+
+    /// An unknown architecture must FAIL rather than fall back to BERT. Falling
+    /// back would load a wrong backbone and serve plausible-looking embeddings.
+    #[test]
+    fn u073_unknown_model_type_is_rejected() {
+        let alien = r#"{"model_type": "t5", "hidden_size": 768}"#;
+        assert!(
+            Backbone::parse_config(alien).is_err(),
+            "an unknown model_type must be rejected, never silently treated as BERT"
+        );
+    }
 
     fn artifact(name: &str) -> std::path::PathBuf {
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))

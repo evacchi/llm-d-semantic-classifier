@@ -19,6 +19,31 @@ pub const MODELCAR_REQUIRED_FILES: &[&str] = &[
     "1_Pooling/config.json",
 ];
 
+/// The required-file set for the ModelCar at `dir`, chosen by the architecture
+/// its `config.json` declares.
+///
+/// `1_Pooling/config.json` is a sentence-transformers artifact. BERT ModelCars
+/// built by this project ship it and it pins the embedding dimension, so it
+/// stays required for them. ModernBERT ModelCars published upstream -- the Vela
+/// family is the case in hand -- do not ship a sentence-transformers module
+/// stack at all, so demanding that file makes a well-formed artifact
+/// permanently unready for a file it was never meant to contain.
+///
+/// An unreadable or unparseable `config.json` returns the BERT set: that is the
+/// stricter requirement, and a ModelCar whose config cannot be read must fail
+/// readiness on its own merits rather than be granted a relaxed file list.
+pub fn modelcar_required_files<P: AsRef<Path>>(dir: P) -> &'static [&'static str] {
+    const MODERNBERT: &[&str] = &["model.safetensors", "config.json", "tokenizer.json"];
+    let cfg = dir.as_ref().join("config.json");
+    match std::fs::read_to_string(cfg) {
+        Ok(raw) => match crate::embedding::Backbone::parse_config(&raw) {
+            Ok(c) if c.kind() == crate::embedding::BackboneKind::ModernBert => MODERNBERT,
+            _ => MODELCAR_REQUIRED_FILES,
+        },
+        Err(_) => MODELCAR_REQUIRED_FILES,
+    }
+}
+
 /// A content digest over the resident ModelCar's required files.
 ///
 /// `model_revision` records which revision was REQUESTED. It cannot show that
@@ -197,6 +222,66 @@ impl Default for Runtime {
 #[cfg(test)]
 mod tests {
     use super::{Runtime, MODELCAR_REQUIRED_FILES};
+
+    /// Vela ModelCars (llm-semantic-router/Vela-1.0-Encoder-307M*) are
+    /// ModernBERT and ship no sentence-transformers module stack, so they have
+    /// no 1_Pooling/config.json. Requiring it made a well-formed artifact
+    /// permanently unready for a file it was never meant to contain.
+    #[test]
+    fn u074_modernbert_modelcar_does_not_require_pooling_config() {
+        let dir = std::env::temp_dir().join("llm-d-sc-u074");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{"model_type":"modernbert","vocab_size":256000,"hidden_size":768,
+                "num_hidden_layers":22,"num_attention_heads":12,
+                "intermediate_size":1152,"max_position_embeddings":32768,
+                "layer_norm_eps":1e-5,"pad_token_id":1,
+                "global_attn_every_n_layers":3,"global_rope_theta":160000.0,
+                "local_attention":128,"local_rope_theta":10000.0}"#,
+        )
+        .unwrap();
+        let req = super::modelcar_required_files(&dir);
+        assert!(
+            !req.contains(&"1_Pooling/config.json"),
+            "ModernBERT must not require a sentence-transformers pooling config"
+        );
+        assert!(req.contains(&"model.safetensors") && req.contains(&"config.json"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The BERT path must be unchanged -- every classifier already deployed by
+    /// this project ships 1_Pooling/config.json and relies on it to pin the
+    /// embedding dimension.
+    #[test]
+    fn u075_bert_modelcar_still_requires_pooling_config() {
+        let dir = std::env::temp_dir().join("llm-d-sc-u075");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{"model_type":"bert","vocab_size":30522,"hidden_size":384,
+                "num_hidden_layers":6,"num_attention_heads":12,
+                "intermediate_size":1536,"max_position_embeddings":512,
+                "type_vocab_size":2,"layer_norm_eps":1e-12,"hidden_act":"gelu",
+                "hidden_dropout_prob":0.1,"initializer_range":0.02,
+                "pad_token_id":0,"classifier_dropout":null}"#,
+        )
+        .unwrap();
+        assert!(super::modelcar_required_files(&dir).contains(&"1_Pooling/config.json"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// An unreadable config must get the STRICTER set, never the relaxed one:
+    /// a ModelCar we cannot identify must not be granted a shorter file list.
+    #[test]
+    fn u076_unreadable_config_falls_back_to_the_strict_set() {
+        let dir = std::env::temp_dir().join("llm-d-sc-u076-missing");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            super::modelcar_required_files(&dir),
+            MODELCAR_REQUIRED_FILES
+        );
+    }
 
     #[test]
     fn u020_readiness_false_before_successful_warmup() {
