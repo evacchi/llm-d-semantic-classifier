@@ -30,6 +30,13 @@ pub enum EmbeddingError {
     Candle(candle_core::Error),
     Tokenizer(crate::tokenizer::TokenizerError),
     MissingField(&'static str),
+
+    /// The checkpoint declares a rotary scaling this build cannot honour.
+    ///
+    /// A hard error rather than a warning: the failure it prevents is silent,
+    /// and a service that started anyway would answer confidently with wrong
+    /// embeddings.
+    UnsupportedRopeScaling(String),
 }
 
 impl std::fmt::Display for EmbeddingError {
@@ -37,6 +44,15 @@ impl std::fmt::Display for EmbeddingError {
         match self {
             EmbeddingError::Io(e) => write!(f, "embedding config io error: {e}"),
             EmbeddingError::Json(e) => write!(f, "embedding config json error: {e}"),
+            EmbeddingError::UnsupportedRopeScaling(kind) => write!(
+                f,
+                "checkpoint declares rope_scaling type '{kind}', which this build \
+                 cannot honour: the resident candle ignores rope_scaling, so the \
+                 encoder would emit rotated embeddings while argmax still looked \
+                 plausible. Refusing to load rather than serving wrong scores. \
+                 Use a checkpoint without rope_scaling, or a build whose candle \
+                 supports it."
+            ),
             EmbeddingError::Candle(e) => write!(f, "embedding candle error: {e}"),
             EmbeddingError::Tokenizer(e) => write!(f, "embedding tokenizer error: {e}"),
             EmbeddingError::MissingField(name) => {
@@ -86,6 +102,24 @@ impl EmbeddingContract {
 /// A resident embedder: the real Candle forward over the pinned sensitivity
 /// BERT model, tokenized by the resident [`Tokenizer`].
 ///
+/// The `rope_scaling.rope_type` a config declares, if any.
+///
+/// Read directly rather than through the backbone config, because the whole
+/// point is to inspect a field the backbone config does not model.
+fn rope_scaling_kind(raw: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let rs = v.get("rope_scaling")?;
+    if rs.is_null() {
+        return None;
+    }
+    Some(
+        rs.get("rope_type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown")
+            .to_string(),
+    )
+}
+
 /// Which encoder architecture a ModelCar declares.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackboneKind {
@@ -151,9 +185,29 @@ impl Backbone {
             None | Some("bert") => Ok(BackboneConfig::Bert(Box::new(
                 serde_json::from_str(raw).map_err(EmbeddingError::Json)?,
             ))),
-            Some("modernbert") => Ok(BackboneConfig::ModernBert(Box::new(
-                serde_json::from_str(raw).map_err(EmbeddingError::Json)?,
-            ))),
+            Some("modernbert") => {
+                // REFUSE what we cannot serve faithfully.
+                //
+                // `rope_scaling` reshapes the rotary frequency spectrum, and the
+                // resident candle does not read it. Loading such a checkpoint
+                // anyway produces embeddings that are wrong in the worst way:
+                // magnitudes are preserved, directions are rotated, and argmax
+                // survives on easy inputs -- so labels look right while every
+                // score, threshold and cached embedding is nonsense. Measured on
+                // a YaRN checkpoint: hidden-state cosine 0.92-0.96 against the
+                // reference, and a top-1 logit of 11.4986 where the checkpoint
+                // says 9.9652.
+                //
+                // Refusing at load is the only point where this is visible. Once
+                // the service is answering, nothing downstream can tell the
+                // difference without a parity check against the original.
+                if let Some(kind) = rope_scaling_kind(raw) {
+                    return Err(EmbeddingError::UnsupportedRopeScaling(kind));
+                }
+                Ok(BackboneConfig::ModernBert(Box::new(
+                    serde_json::from_str(raw).map_err(EmbeddingError::Json)?,
+                )))
+            }
             Some(_) => Err(EmbeddingError::MissingField(
                 "unsupported model_type; llm-d-sc serves bert and modernbert",
             )),
@@ -506,6 +560,79 @@ mod tests {
             Backbone::parse_config(alien).is_err(),
             "an unknown model_type must be rejected, never silently treated as BERT"
         );
+    }
+
+    /// A checkpoint we cannot serve faithfully must be REFUSED, not loaded.
+    ///
+    /// All twelve models in the Vela family declare `rope_scaling.rope_type:
+    /// "yarn"`. The resident candle ignores it, so the encoder emits rotated
+    /// embeddings -- measured hidden-state cosine 0.92-0.96 against the
+    /// reference, and a top-1 logit of 11.4986 where the checkpoint says 9.9652.
+    /// Magnitudes survive and argmax usually survives, so labels look right
+    /// while every score and cached embedding is wrong.
+    ///
+    /// Load time is the only place this is visible. Once the service is
+    /// answering, nothing downstream can tell without a parity check.
+    #[test]
+    fn u077_rope_scaling_checkpoints_are_refused() {
+        let vela = r#"{
+          "model_type": "modernbert",
+          "rope_scaling": {"rope_type": "yarn", "factor": 4.0,
+                           "original_max_position_embeddings": 8192},
+          "vocab_size": 256000, "hidden_size": 768, "num_hidden_layers": 22,
+          "num_attention_heads": 12, "intermediate_size": 1152,
+          "max_position_embeddings": 32768, "layer_norm_eps": 1e-5,
+          "pad_token_id": 1, "global_attn_every_n_layers": 3,
+          "global_rope_theta": 160000.0, "local_attention": 128,
+          "local_rope_theta": 160000.0
+        }"#;
+        let msg = match Backbone::parse_config(vela) {
+            Err(e) => format!("{e}"),
+            Ok(_) => panic!("a YaRN checkpoint must be refused, not loaded"),
+        };
+        assert!(
+            msg.contains("yarn"),
+            "the error must name the scaling type: {msg}"
+        );
+        assert!(
+            msg.contains("Refusing to load"),
+            "the error must say what it did and why: {msg}"
+        );
+    }
+
+    /// An unscaled ModernBERT must still load. `answerdotai/ModernBERT-base` has
+    /// no rope_scaling and reproduces the reference to 5 decimal places, so
+    /// refusing it would reject a checkpoint this build serves exactly.
+    #[test]
+    fn u078_modernbert_without_rope_scaling_still_loads() {
+        let base = r#"{
+          "model_type": "modernbert",
+          "vocab_size": 50368, "hidden_size": 768, "num_hidden_layers": 22,
+          "num_attention_heads": 12, "intermediate_size": 1152,
+          "max_position_embeddings": 8192, "layer_norm_eps": 1e-5,
+          "pad_token_id": 50283, "global_attn_every_n_layers": 3,
+          "global_rope_theta": 160000.0, "local_attention": 128,
+          "local_rope_theta": 10000.0
+        }"#;
+        match Backbone::parse_config(base) {
+            Ok(c) => assert_eq!(c.kind(), BackboneKind::ModernBert),
+            Err(e) => panic!("an unscaled ModernBERT must load: {e}"),
+        }
+    }
+
+    /// An explicit null must be treated as absent, not as an unknown scaling.
+    #[test]
+    fn u079_null_rope_scaling_is_absent() {
+        let base = r#"{
+          "model_type": "modernbert", "rope_scaling": null,
+          "vocab_size": 50368, "hidden_size": 768, "num_hidden_layers": 22,
+          "num_attention_heads": 12, "intermediate_size": 1152,
+          "max_position_embeddings": 8192, "layer_norm_eps": 1e-5,
+          "pad_token_id": 50283, "global_attn_every_n_layers": 3,
+          "global_rope_theta": 160000.0, "local_attention": 128,
+          "local_rope_theta": 10000.0
+        }"#;
+        assert!(Backbone::parse_config(base).is_ok());
     }
 
     fn artifact(name: &str) -> std::path::PathBuf {
