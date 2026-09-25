@@ -256,8 +256,17 @@ impl Embedder {
         // its weights are actually present. An embedding-only artifact is
         // legitimate and keeps working on the anchor path.
         let labels = crate::head::LabelMap::from_config(&raw);
+        // `classifier_pooling` comes from the checkpoint; CLS is upstream's
+        // default and what BERT-family heads use.
+        let mean_pooling = serde_json::from_str::<serde_json::Value>(&raw)
+            .ok()
+            .and_then(|v| {
+                v.get("classifier_pooling")
+                    .and_then(|p| p.as_str().map(|s| s.eq_ignore_ascii_case("mean")))
+            })
+            .unwrap_or(false);
         let head = match labels.as_ref() {
-            Some(l) => crate::head::SequenceHead::load(&vb, &config, l)?,
+            Some(l) => crate::head::SequenceHead::load(&vb, &config, l, mean_pooling)?,
             None => None,
         };
         let labels = head.as_ref().and(labels);

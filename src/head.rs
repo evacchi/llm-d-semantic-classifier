@@ -22,8 +22,7 @@
 //! composing primitives, not reimplementing a library.
 
 use candle_core::{DType, Tensor};
-use candle_nn::{Linear, Module, VarBuilder};
-use candle_transformers::models::modernbert;
+use candle_nn::{LayerNorm, Linear, Module, VarBuilder};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 
@@ -78,8 +77,38 @@ pub enum SequenceHead {
     /// HuggingFace `BertForSequenceClassification`: pooler dense + tanh on CLS,
     /// then the classifier projection.
     Bert { pooler: Linear, classifier: Linear },
-    /// ModernBERT's own head, straight from `candle_transformers`.
-    ModernBert(Box<modernbert::ModernBertForSequenceClassification>),
+    /// ModernBERT: `head.dense -> gelu_erf -> head.norm -> classifier`, over the
+    /// pooled token.
+    ///
+    /// ASSEMBLED HERE RATHER THAN TAKEN FROM `candle_transformers`, for two
+    /// reasons that are both bugs if ignored:
+    ///
+    /// 1. `ModernBertForSequenceClassification::load` sizes its classifier from
+    ///    `config.classifier_config.id2label.len()`, and that config never
+    ///    deserializes for a real HuggingFace checkpoint. Candle declares
+    ///    `label2id: HashMap<String, String>` while HF emits `String -> int`
+    ///    (`{"biology": 0}`), so the flattened `Option<ClassifierConfig>` silently
+    ///    becomes `None`, the classifier is built with out_dim
+    ///    `unwrap_or_default()` = 0, and the load fails against the real
+    ///    [14, 768] weight. This affects every standard HF ModernBERT classifier,
+    ///    not just Vela.
+    /// 2. `ModernBertClassifier::forward` applies softmax INTERNALLY. Feeding its
+    ///    output into this crate's own softmax would double-apply it and flatten
+    ///    the distribution -- argmax would survive, so accuracy would look fine
+    ///    while every confidence threshold read a squashed distribution. That is
+    ///    the same silent shape as the cosine-normalisation incident.
+    ///
+    /// `ModernBertHead::load` is private upstream, so the two layers are built
+    /// from `candle_nn` primitives in the documented shape. Composing primitives,
+    /// not reimplementing the crate.
+    ModernBert {
+        dense: Linear,
+        norm: LayerNorm,
+        classifier: Linear,
+        /// CLS takes token 0; MEAN averages over the mask. Read from the
+        /// checkpoint's own `classifier_pooling`, defaulting to CLS as upstream does.
+        mean_pooling: bool,
+    },
 }
 
 impl SequenceHead {
@@ -92,6 +121,7 @@ impl SequenceHead {
         vb: &VarBuilder,
         config: &BackboneConfig,
         labels: &LabelMap,
+        mean_pooling: bool,
     ) -> Result<Option<SequenceHead>, EmbeddingError> {
         let n = labels.len();
         if n < 2 {
@@ -113,9 +143,25 @@ impl SequenceHead {
                 }
             }
             BackboneConfig::ModernBert(c) => {
-                match modernbert::ModernBertForSequenceClassification::load(vb.clone(), c) {
-                    Ok(m) => Ok(Some(SequenceHead::ModernBert(Box::new(m)))),
-                    Err(_) => Ok(None),
+                let dense = candle_nn::linear_no_bias(
+                    c.hidden_size,
+                    c.hidden_size,
+                    vb.pp("head").pp("dense"),
+                );
+                let norm = candle_nn::layer_norm_no_bias(
+                    c.hidden_size,
+                    c.layer_norm_eps,
+                    vb.pp("head").pp("norm"),
+                );
+                let classifier = candle_nn::linear(c.hidden_size, n, vb.pp("classifier"));
+                match (dense, norm, classifier) {
+                    (Ok(dense), Ok(norm), Ok(classifier)) => Ok(Some(SequenceHead::ModernBert {
+                        dense,
+                        norm,
+                        classifier,
+                        mean_pooling,
+                    })),
+                    _ => Ok(None),
                 }
             }
         }
@@ -151,12 +197,44 @@ impl SequenceHead {
                     .forward(&pooled)
                     .map_err(EmbeddingError::Candle)?
             }
-            SequenceHead::ModernBert(m) => {
-                let mask = attention_mask
-                    .to_dtype(DType::F32)
-                    .map_err(EmbeddingError::Candle)?;
-                m.forward(input_ids, &mask)
+            SequenceHead::ModernBert {
+                dense,
+                norm,
+                classifier,
+                mean_pooling,
+            } => {
+                let _ = input_ids;
+                let pooled = if *mean_pooling {
+                    let m = attention_mask
+                        .unsqueeze(2)
+                        .map_err(EmbeddingError::Candle)?
+                        .to_dtype(DType::F32)
+                        .map_err(EmbeddingError::Candle)?;
+                    let summed = hidden
+                        .broadcast_mul(&m)
+                        .map_err(EmbeddingError::Candle)?
+                        .sum(1)
+                        .map_err(EmbeddingError::Candle)?;
+                    let counts = m.sum(1).map_err(EmbeddingError::Candle)?;
+                    summed
+                        .broadcast_div(&counts)
+                        .map_err(EmbeddingError::Candle)?
+                } else {
+                    hidden
+                        .i((.., 0, ..))
+                        .map_err(EmbeddingError::Candle)?
+                        .contiguous()
+                        .map_err(EmbeddingError::Candle)?
+                };
+                let x = dense
+                    .forward(&pooled)
                     .map_err(EmbeddingError::Candle)?
+                    .gelu_erf()
+                    .map_err(EmbeddingError::Candle)?;
+                let x = norm.forward(&x).map_err(EmbeddingError::Candle)?;
+                // RAW LOGITS. The caller applies this crate's stable softmax;
+                // returning probabilities here would double-apply it.
+                classifier.forward(&x).map_err(EmbeddingError::Candle)?
             }
         };
         out.flatten_all()
@@ -271,6 +349,37 @@ mod tests {
     fn u085_softmax_of_non_finite_is_not_nan() {
         let p = softmax(&[f32::NAN, f32::NAN]);
         assert!(p.iter().all(|x| x.is_finite()), "must not emit NaN");
+    }
+
+    /// THE UPSTREAM INCOMPATIBILITY, pinned so a future "just use candle's
+    /// ModernBertForSequenceClassification" cannot quietly reintroduce it.
+    ///
+    /// candle_transformers declares `ClassifierConfig.label2id` as
+    /// `HashMap<String, String>`, but HuggingFace emits `String -> int`. Because
+    /// the field is a flattened `Option`, the mismatch does not error -- it
+    /// yields `None`, the classifier is sized `unwrap_or_default()` = 0, and the
+    /// load fails against the real [14, 768] weight. llm-d-sc then fell back to
+    /// anchor ranking and served a DOMAIN classifier's traffic using the resident
+    /// COMPLEXITY taxonomy: `hi -> SIMPLE 0.449` where the checkpoint says
+    /// `other 0.994`. Confident nonsense, no error anywhere.
+    #[test]
+    fn u087_hf_label2id_is_string_to_int_not_string_to_string() {
+        // Exactly the shape every HF ModernBERT classifier ships.
+        let hf = r#"{"id2label":{"0":"biology","1":"business"},
+                     "label2id":{"biology":0,"business":1},
+                     "classifier_pooling":"cls"}"#;
+        // Our own parser reads the labels regardless of label2id's value type.
+        let m = LabelMap::from_config(hf).expect("HF config must yield labels");
+        assert_eq!(m.labels(), ["biology", "business"]);
+
+        // And the shape candle would need instead -- documented, not used.
+        let candle_shape = r#"{"id2label":{"0":"biology"},
+                               "label2id":{"biology":"0"},
+                               "classifier_pooling":"cls"}"#;
+        assert!(
+            LabelMap::from_config(candle_shape).is_some(),
+            "our parser must accept both; only candle's is strict"
+        );
     }
 
     /// A single-class head decides nothing and must not be loaded as if it did.
