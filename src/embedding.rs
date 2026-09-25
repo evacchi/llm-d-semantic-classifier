@@ -339,6 +339,31 @@ impl Embedder {
         self.labels.as_ref().map(crate::head::LabelMap::labels)
     }
 
+    /// The raw encoder output for one tokenized input: `[seq_len, hidden]`,
+    /// flattened row-major.
+    ///
+    /// Exists to BISECT a parity gap, not to serve traffic. When Rust and
+    /// PyTorch agree on token IDs but disagree on logits, the question is
+    /// whether the encoder or the head diverged, and only the pre-head hidden
+    /// states answer it. Without this the investigation is guesswork -- which is
+    /// how a wrong hypothesis (`classifier_bias`) consumed a cycle.
+    pub fn hidden_states(&self, ids: Vec<u32>) -> Result<(usize, Vec<f32>), EmbeddingError> {
+        let seq_len = ids.len();
+        let device = self.model.device();
+        let input_ids =
+            Tensor::from_vec(ids, (1, seq_len), device).map_err(EmbeddingError::Candle)?;
+        let attention_mask =
+            Tensor::ones((1, seq_len), DType::U32, device).map_err(EmbeddingError::Candle)?;
+        let seq = self.model.forward(&input_ids, &attention_mask)?;
+        let flat = seq
+            .squeeze(0)
+            .map_err(EmbeddingError::Candle)?
+            .flatten_all()
+            .map_err(EmbeddingError::Candle)?;
+        let v = flat.to_vec1::<f32>().map_err(EmbeddingError::Candle)?;
+        Ok((seq_len, v))
+    }
+
     /// Embed AND classify in one forward.
     ///
     /// One forward, two outputs. Running the encoder again to get logits would

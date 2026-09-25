@@ -27,6 +27,15 @@ fn main() {
     for text in ["hi", "what is 2+2"] {
         let ids = tok.tokenize(text).expect("tokenize");
         println!("IDS\t{text}\t{ids:?}");
+        // BISECT: the encoder's CLS row, before any head touches it. If this
+        // already differs from PyTorch, the gap is candle's ModernBert forward
+        // and belongs upstream; if it matches, the gap is ours.
+        let (n, h) = emb.hidden_states(ids.clone()).expect("hidden");
+        let hid = h.len() / n;
+        let cls = &h[0..hid];
+        let norm: f32 = cls.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let head8: Vec<String> = cls.iter().take(8).map(|x| format!("{x:.5}")).collect();
+        println!("CLS\t{text}\tnorm={norm:.5}\t[{}]", head8.join(", "));
         let (_v, logits) = emb.embed_and_classify(ids).expect("forward");
         match logits {
             None => println!("LOGITS\t{text}\tNONE (head did not load)"),
