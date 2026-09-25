@@ -14,6 +14,7 @@ pub mod dummy_gateway;
 pub mod embedding;
 pub mod grpc;
 pub mod handoff;
+pub mod head;
 pub mod metrics;
 pub mod queue;
 pub mod ranker;
