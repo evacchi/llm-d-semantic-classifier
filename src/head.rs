@@ -122,6 +122,7 @@ impl SequenceHead {
         config: &BackboneConfig,
         labels: &LabelMap,
         mean_pooling: bool,
+        classifier_bias: bool,
     ) -> Result<Option<SequenceHead>, EmbeddingError> {
         let n = labels.len();
         if n < 2 {
@@ -153,7 +154,20 @@ impl SequenceHead {
                     c.layer_norm_eps,
                     vb.pp("head").pp("norm"),
                 );
-                let classifier = candle_nn::linear(c.hidden_size, n, vb.pp("classifier"));
+                // HONOUR `classifier_bias`. Vela ships a `classifier.bias`
+                // tensor while its config sets `classifier_bias: false`, so
+                // PyTorch builds the Linear WITHOUT a bias and never applies the
+                // stored one. Loading it anyway adds a per-class constant the
+                // checkpoint does not use: argmax survives a small additive
+                // shift, so labels still matched while probabilities diverged in
+                // MIXED directions (0.9962 vs 0.9389 on one input, 0.9834 vs
+                // 0.9940 on another). A dead tensor in the file is not a
+                // licence to apply it.
+                let classifier = if classifier_bias {
+                    candle_nn::linear(c.hidden_size, n, vb.pp("classifier"))
+                } else {
+                    candle_nn::linear_no_bias(c.hidden_size, n, vb.pp("classifier"))
+                };
                 match (dense, norm, classifier) {
                     (Ok(dense), Ok(norm), Ok(classifier)) => Ok(Some(SequenceHead::ModernBert {
                         dense,
@@ -380,6 +394,39 @@ mod tests {
             LabelMap::from_config(candle_shape).is_some(),
             "our parser must accept both; only candle's is strict"
         );
+    }
+
+    /// A tensor present in the file is not a licence to apply it.
+    ///
+    /// Vela ships `classifier.bias: [14]` while its config sets
+    /// `classifier_bias: false`. PyTorch honours the config and never applies
+    /// the stored tensor. Applying it adds a per-class constant the checkpoint
+    /// does not use -- argmax survives a small additive shift, so LABELS still
+    /// matched PyTorch exactly while PROBABILITIES diverged in mixed directions.
+    /// Labels-only parity would have passed this bug straight through.
+    #[test]
+    fn u088_classifier_bias_defaults_true_but_false_is_honoured() {
+        let explicit_false = r#"{"classifier_bias": false}"#;
+        let absent = r#"{"hidden_size": 768}"#;
+        let explicit_true = r#"{"classifier_bias": true}"#;
+        let read = |raw: &str| {
+            serde_json::from_str::<serde_json::Value>(raw)
+                .ok()
+                .and_then(|v| {
+                    v.get("classifier_bias")
+                        .and_then(serde_json::Value::as_bool)
+                })
+                .unwrap_or(true)
+        };
+        assert!(
+            !read(explicit_false),
+            "an explicit false must drop the bias"
+        );
+        assert!(
+            read(absent),
+            "absent means the HuggingFace default, which HAS a bias"
+        );
+        assert!(read(explicit_true));
     }
 
     /// A single-class head decides nothing and must not be loaded as if it did.

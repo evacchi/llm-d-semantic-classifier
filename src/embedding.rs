@@ -265,8 +265,19 @@ impl Embedder {
                     .and_then(|p| p.as_str().map(|s| s.eq_ignore_ascii_case("mean")))
             })
             .unwrap_or(false);
+        // Defaults to TRUE: a checkpoint that says nothing is the HuggingFace
+        // default, which has a bias. Only an explicit `false` drops it.
+        let classifier_bias = serde_json::from_str::<serde_json::Value>(&raw)
+            .ok()
+            .and_then(|v| {
+                v.get("classifier_bias")
+                    .and_then(serde_json::Value::as_bool)
+            })
+            .unwrap_or(true);
         let head = match labels.as_ref() {
-            Some(l) => crate::head::SequenceHead::load(&vb, &config, l, mean_pooling)?,
+            Some(l) => {
+                crate::head::SequenceHead::load(&vb, &config, l, mean_pooling, classifier_bias)?
+            }
             None => None,
         };
         let labels = head.as_ref().and(labels);
