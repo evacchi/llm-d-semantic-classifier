@@ -139,9 +139,19 @@ pub struct MetricsSnapshot {
     pub cache_hits: u64,
     /// Number of classification requests that ran a real forward (cache miss).
     pub cache_misses: u64,
+    /// Number of L2 cache hits.
+    pub l2_hits: u64,
+    /// Number of L2 cache misses.
+    pub l2_misses: u64,
+    /// Number of L2 degraded responses.
+    pub l2_degraded: u64,
     /// Number of classification requests that waited for another thread's
     /// in-flight forward (single-flight coalesced, AC-007).
     pub cache_coalesced: u64,
+    /// Number of queued jobs discarded after their deadline elapsed.
+    pub queued_expired: u64,
+    /// Number of queued jobs discarded after their caller cancelled.
+    pub queued_cancelled: u64,
 }
 
 /// The shared latency/counter registry behind the metrics surface.
@@ -162,7 +172,12 @@ struct Inner {
     total: Duration,
     cache_hits: u64,
     cache_misses: u64,
+    l2_hits: u64,
+    l2_misses: u64,
+    l2_degraded: u64,
     cache_coalesced: u64,
+    queued_expired: u64,
+    queued_cancelled: u64,
     hist_queue: Histogram,
     hist_tokenize: Histogram,
     hist_forward: Histogram,
@@ -222,11 +237,36 @@ impl Metrics {
         self.inner.lock().unwrap().cache_misses += 1;
     }
 
+    /// Record one L2 cache hit.
+    pub fn record_l2_hit(&self) {
+        self.inner.lock().unwrap().l2_hits += 1;
+    }
+
+    /// Record one L2 cache miss.
+    pub fn record_l2_miss(&self) {
+        self.inner.lock().unwrap().l2_misses += 1;
+    }
+
+    /// Record one L2 degraded response.
+    pub fn record_l2_degraded(&self) {
+        self.inner.lock().unwrap().l2_degraded += 1;
+    }
+
     /// Record one classification that waited for another thread's in-flight
     /// forward (single-flight coalesced, AC-007). Previously counted as a
     /// cache hit, but with miss-class latency.
     pub fn record_cache_coalesced(&self) {
         self.inner.lock().unwrap().cache_coalesced += 1;
+    }
+
+    /// Record one queued job discarded after its deadline elapsed.
+    pub fn record_queued_expired(&self) {
+        self.inner.lock().unwrap().queued_expired += 1;
+    }
+
+    /// Record one queued job discarded after its caller cancelled.
+    pub fn record_queued_cancelled(&self) {
+        self.inner.lock().unwrap().queued_cancelled += 1;
     }
 
     /// An immutable snapshot of the accumulated latency decomposition.
@@ -239,7 +279,12 @@ impl Metrics {
             total: inner.total,
             cache_hits: inner.cache_hits,
             cache_misses: inner.cache_misses,
+            l2_hits: inner.l2_hits,
+            l2_misses: inner.l2_misses,
+            l2_degraded: inner.l2_degraded,
             cache_coalesced: inner.cache_coalesced,
+            queued_expired: inner.queued_expired,
+            queued_cancelled: inner.queued_cancelled,
         }
     }
 }
@@ -395,5 +440,31 @@ mod tests {
             snap.cache_hits + snap.cache_misses + snap.cache_coalesced,
             6
         );
+    }
+
+    /// L2 counters increment independently.
+    #[test]
+    fn l2_counters_increment_independently() {
+        let m = Metrics::new();
+        m.record_l2_hit();
+        m.record_l2_hit();
+        m.record_l2_miss();
+        m.record_l2_degraded();
+        let s = m.snapshot();
+        assert_eq!(s.l2_hits, 2);
+        assert_eq!(s.l2_misses, 1);
+        assert_eq!(s.l2_degraded, 1);
+    }
+
+    #[test]
+    fn u082_queued_discard_counters_are_separate() {
+        let metrics = Metrics::new();
+        metrics.record_queued_expired();
+        metrics.record_queued_expired();
+        metrics.record_queued_cancelled();
+
+        let snap = metrics.snapshot();
+        assert_eq!(snap.queued_expired, 2);
+        assert_eq!(snap.queued_cancelled, 1);
     }
 }

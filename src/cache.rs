@@ -19,11 +19,28 @@
 //! The cache stores the typed [`crate::classify::ClassificationResult`], not a
 //! `String`.
 
+// The Redis semantic (L2) backend and its supporting modules are compiled only
+// when the `redis-semantic` feature is enabled. The `SemanticCache` trait,
+// `NoopSemanticCache`, and `identity_tag` below stay always-compiled — they are
+// the seam `ServiceCore` uses, defaulting to the Noop (off) cache.
+pub mod text;
+
+#[cfg(feature = "redis-semantic")]
+pub mod breaker;
+#[cfg(feature = "redis-semantic")]
+pub mod redis;
+#[cfg(feature = "redis-semantic")]
+pub mod redis_codec;
+// Semantic cache for full LLM responses (playground/gateway use). Reuses the
+// RediSearch vector-KNN machinery in a separate index/namespace.
+#[cfg(feature = "redis-semantic")]
+pub mod response;
+
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Condvar, Mutex};
 
-use crate::classify::{ClassificationResult, ClassifyError};
+use crate::classify::{ClassificationResult, ClassifyError, Embedding};
 
 /// The path a request took through the cache pipeline.
 ///
@@ -70,12 +87,36 @@ impl CacheKey {
         taxonomy_revision: impl Into<String>,
         normalized_text: &str,
     ) -> Self {
+        Self::new_with_artifact_digest(
+            classifier_id,
+            model_revision,
+            tokenizer_revision,
+            taxonomy_revision,
+            normalized_text,
+            None,
+        )
+    }
+
+    /// Build a key with both the declared revision and the loaded artifact's
+    /// content digest. The optional digest is a separate length-prefixed field;
+    /// it never replaces the model revision. `None` preserves `new`'s identity.
+    pub fn new_with_artifact_digest(
+        classifier_id: impl Into<String>,
+        model_revision: impl Into<String>,
+        tokenizer_revision: impl Into<String>,
+        taxonomy_revision: impl Into<String>,
+        normalized_text: &str,
+        artifact_digest: Option<&str>,
+    ) -> Self {
         let mut hasher = blake3::Hasher::new();
         update_field(&mut hasher, &classifier_id.into());
         update_field(&mut hasher, &model_revision.into());
         update_field(&mut hasher, &tokenizer_revision.into());
         update_field(&mut hasher, &taxonomy_revision.into());
         update_field(&mut hasher, normalized_text);
+        if let Some(digest) = artifact_digest {
+            update_field(&mut hasher, digest);
+        }
         CacheKey {
             fingerprint: hasher.finalize().into(),
         }
@@ -369,6 +410,51 @@ impl Default for SharedCache {
 impl Default for ExactCache {
     fn default() -> Self {
         ExactCache::new()
+    }
+}
+
+/// The pluggable L2 (semantic / approximate) cache seam.
+///
+/// Interposes on the embedding between `embed` and `rank`. It is BEST-EFFORT:
+/// `lookup` returns `None` on any error (fail-open to compute) and `insert`
+/// is fire-and-forget. `identity` isolates entries by classifier/model/
+/// tokenizer/taxonomy so a revision change can never serve a stale label.
+pub trait SemanticCache: Send + Sync {
+    /// Return a stored result whose embedding is within the configured
+    /// similarity threshold of `embedding` and shares `identity`, else `None`.
+    fn lookup(&self, embedding: &Embedding, identity: &str) -> Option<ClassificationResult>;
+
+    /// Record `result` under `embedding` and `identity`. Best-effort; never blocks.
+    fn insert(&self, embedding: &Embedding, result: &ClassificationResult, identity: &str);
+}
+
+/// The default L2 cache: always misses, never stores. Zero cost when the
+/// semantic tier is disabled.
+pub struct NoopSemanticCache;
+
+impl SemanticCache for NoopSemanticCache {
+    fn lookup(&self, _embedding: &Embedding, _identity: &str) -> Option<ClassificationResult> {
+        None
+    }
+    fn insert(&self, _embedding: &Embedding, _result: &ClassificationResult, _identity: &str) {}
+}
+
+/// Build the L2 isolation tag from a cache-identity tuple (same fields as the
+/// blake3 L1 key), pipe-separated so field boundaries cannot alias.
+///
+/// The artifact digest is a fifth, OPTIONAL field and is appended only when
+/// present, mirroring how the L1 key hashes it. That is what keeps the two
+/// tiers in step: L1 now isolates by loaded-artifact digest, so an L2 tag that
+/// ignored it would let a digest change with an UNCHANGED revision serve a
+/// stale semantic label from L2 while L1 correctly missed -- reintroducing, one
+/// tier down, exactly the aliasing the digest was added to prevent.
+///
+/// `None` emits the original four-field tag, so identities without a digest
+/// keep their previous value and no existing L2 entry is orphaned.
+pub fn identity_tag(id: (&str, &str, &str, &str, Option<&str>)) -> String {
+    match id.4 {
+        Some(digest) => format!("{}|{}|{}|{}|{}", id.0, id.1, id.2, id.3, digest),
+        None => format!("{}|{}|{}|{}", id.0, id.1, id.2, id.3),
     }
 }
 
@@ -667,5 +753,74 @@ mod tests {
             "all other callers must be coalesced waits"
         );
         assert_eq!(hits, 0, "no true cache hits on a cold cache");
+    }
+}
+
+#[cfg(test)]
+mod semantic_tests {
+    use super::*;
+    use crate::classify::{ClassifyStatus, RankedSignal};
+
+    fn result(id: &str) -> ClassificationResult {
+        ClassificationResult {
+            classifier_id: "c".into(),
+            model_revision: "m".into(),
+            tokenizer_revision: "t".into(),
+            taxonomy_revision: "x".into(),
+            status: ClassifyStatus::Ok,
+            ranked: vec![RankedSignal {
+                id: id.into(),
+                score: 1.0,
+            }],
+        }
+    }
+
+    #[test]
+    fn noop_semantic_cache_never_hits() {
+        let cache = NoopSemanticCache;
+        let e = Embedding::new(vec![1.0, 0.0]);
+        cache.insert(&e, &result("simple"), "c|m|t|x");
+        assert!(
+            cache.lookup(&e, "c|m|t|x").is_none(),
+            "noop must always miss"
+        );
+    }
+
+    #[test]
+    fn identity_tag_is_stable_and_field_separated() {
+        assert_eq!(identity_tag(("c", "m", "t", "x", None)), "c|m|t|x");
+        assert_ne!(
+            identity_tag(("a", "bc", "d", "e", None)),
+            identity_tag(("ab", "c", "d", "e", None))
+        );
+    }
+
+    /// The L2 tag must isolate on the loaded artifact digest exactly as the L1
+    /// blake3 key does. If it did not, a rebuilt artifact under an UNCHANGED
+    /// revision would miss in L1 and then HIT in L2, serving a semantic label
+    /// computed by the previous model -- the aliasing the digest exists to
+    /// prevent, reintroduced one tier down.
+    #[test]
+    fn identity_tag_isolates_on_artifact_digest() {
+        let a = identity_tag(("c", "m", "t", "x", Some("sha256:aaa")));
+        let b = identity_tag(("c", "m", "t", "x", Some("sha256:bbb")));
+        assert_ne!(
+            a, b,
+            "same revision, different artifact must not share an L2 tag"
+        );
+
+        // None keeps the historical four-field tag, so identities without a
+        // recorded digest are not orphaned from their existing L2 entries.
+        assert_eq!(identity_tag(("c", "m", "t", "x", None)), "c|m|t|x");
+        assert_ne!(identity_tag(("c", "m", "t", "x", Some("d"))), "c|m|t|x");
+
+        // NOT asserted here: that a pipe INSIDE a field cannot alias. It can,
+        // and it could before the digest was added --
+        //     ("a","b","c|d","e") and ("a","b","c","d|e") both render "a|b|c|d|e".
+        // L1 does not have this problem because update_field length-prefixes
+        // every field; the L2 tag only separates them. Fixing it changes the
+        // tag format and orphans existing L2 entries, so it is left as a
+        // separate change rather than folded into this one. Left undisturbed,
+        // not endorsed.
     }
 }

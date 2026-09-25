@@ -14,9 +14,36 @@ use crate::tokenizer::Tokenizer;
 /// can validate the ModelCar layout before loading (AC-002/AC-003).
 pub const MODELCAR_REQUIRED_FILES: &[&str] = &[
     "model.safetensors",
+    "config.json",
     "tokenizer.json",
     "1_Pooling/config.json",
 ];
+
+/// The required-file set for the ModelCar at `dir`.
+///
+/// `1_Pooling/config.json` is a **sentence-transformers** artifact, and what
+/// declares that module stack is `modules.json`. So the requirement keys on
+/// `modules.json`, not on the architecture.
+///
+/// An earlier version keyed on architecture -- BERT required the pooling config,
+/// ModernBERT did not -- which was wrong in the direction that matters. A BERT
+/// `ForSequenceClassification` checkpoint published straight from HuggingFace has
+/// no `1_Pooling` either, and that is exactly the artifact shape we most want to
+/// serve now that trained heads are used. `cnuland/llm-d-sc-complexity-v3` failed
+/// readiness on a file it was never meant to contain, while `Embedder::load`
+/// would have loaded it happily: the gate was stricter than the loader it gates.
+///
+/// A ModelCar that DOES declare the module stack still must ship the pooling
+/// config -- a declared-then-missing module is a broken artifact, not an optional
+/// one.
+pub fn modelcar_required_files<P: AsRef<Path>>(dir: P) -> &'static [&'static str] {
+    const CORE: &[&str] = &["model.safetensors", "config.json", "tokenizer.json"];
+    if dir.as_ref().join("modules.json").exists() {
+        MODELCAR_REQUIRED_FILES
+    } else {
+        CORE
+    }
+}
 
 /// A content digest over the resident ModelCar's required files.
 ///
@@ -197,6 +224,75 @@ impl Default for Runtime {
 mod tests {
     use super::{Runtime, MODELCAR_REQUIRED_FILES};
 
+    /// A ModelCar with no sentence-transformers module stack (no modules.json)
+    /// must not be asked for 1_Pooling/config.json. Both Vela (ModernBERT) and a
+    /// plain HF BertForSequenceClassification checkpoint are this shape, and
+    /// requiring it made well-formed artifacts permanently unready for a file
+    /// they were never meant to contain.
+    #[test]
+    fn u074_modelcar_without_modules_json_does_not_require_pooling_config() {
+        let dir = std::env::temp_dir().join("llm-d-sc-u074");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{"model_type":"modernbert","vocab_size":256000,"hidden_size":768,
+                "num_hidden_layers":22,"num_attention_heads":12,
+                "intermediate_size":1152,"max_position_embeddings":32768,
+                "layer_norm_eps":1e-5,"pad_token_id":1,
+                "global_attn_every_n_layers":3,"global_rope_theta":160000.0,
+                "local_attention":128,"local_rope_theta":10000.0}"#,
+        )
+        .unwrap();
+        let req = super::modelcar_required_files(&dir);
+        assert!(
+            !req.contains(&"1_Pooling/config.json"),
+            "ModernBERT must not require a sentence-transformers pooling config"
+        );
+        assert!(req.contains(&"model.safetensors") && req.contains(&"config.json"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A ModelCar that DECLARES the module stack must still ship the pooling
+    /// config: declared-then-missing is a broken artifact. Every classifier this
+    /// project has deployed is this shape.
+    #[test]
+    fn u075_modelcar_with_modules_json_still_requires_pooling_config() {
+        let dir = std::env::temp_dir().join("llm-d-sc-u075");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{"model_type":"bert","vocab_size":30522,"hidden_size":384,
+                "num_hidden_layers":6,"num_attention_heads":12,
+                "intermediate_size":1536,"max_position_embeddings":512,
+                "type_vocab_size":2,"layer_norm_eps":1e-12,"hidden_act":"gelu",
+                "hidden_dropout_prob":0.1,"initializer_range":0.02,
+                "pad_token_id":0,"classifier_dropout":null}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("modules.json"), r#"[{"idx":0,"path":""}]"#).unwrap();
+        assert!(super::modelcar_required_files(&dir).contains(&"1_Pooling/config.json"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A plain HF classifier checkpoint -- config.json + weights + tokenizer, no
+    /// modules.json -- must be servable. This is the artifact shape that failed
+    /// on the cluster (cnuland/llm-d-sc-complexity-v3) and motivated the rule.
+    #[test]
+    fn u076_plain_hf_classifier_checkpoint_is_servable() {
+        let dir = std::env::temp_dir().join("llm-d-sc-u076");
+        std::fs::create_dir_all(&dir).unwrap();
+        for f in ["config.json", "model.safetensors", "tokenizer.json"] {
+            std::fs::write(dir.join(f), "{}").unwrap();
+        }
+        let req = super::modelcar_required_files(&dir);
+        assert!(!req.contains(&"1_Pooling/config.json"));
+        assert!(
+            req.iter().all(|f| dir.join(f).exists()),
+            "every required file must be present for a plain HF checkpoint"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn u020_readiness_false_before_successful_warmup() {
         let mut runtime = Runtime::new();
@@ -266,7 +362,7 @@ mod tests {
     fn i064_incomplete_modelcar_fails_readiness() {
         // I-064 (AC-003): an incomplete/corrupt ModelCar must fail readiness.
         // The ModelCar manifest (classifier-manifest.json) requires the files
-        // `/models/model.safetensors`, `/models/tokenizer.json`, and
+        // `/models/model.safetensors`, `/models/config.json`, `/models/tokenizer.json`, and
         // `/models/1_Pooling/config.json` to be present and readable. A model
         // directory that exists but is missing these required files must keep
         // the runtime NOT ready.

@@ -28,6 +28,8 @@ struct InferenceJob {
     /// The instant the request was admitted to the queue. Queue wait is measured
     /// from here to forward start through the existing Queue stage.
     queued_at: std::time::Instant,
+    /// Monotonic deadline inherited from the caller's gRPC timeout.
+    deadline: Option<std::time::Instant>,
     /// The oneshot the handler awaits to receive the forward result.
     respond: oneshot::Sender<Result<ClassificationResult, ClassifyError>>,
     /// Held until the forward completes so the total (in-flight + queued) bound
@@ -153,6 +155,33 @@ impl<R: ClassifierRuntime + Send + Sync + 'static> InferenceExecutor<R> {
                                     guard.blocking_recv()
                                 };
                                 let Some(job) = job else { return };
+                                let expired = job
+                                    .deadline
+                                    .is_some_and(|deadline| std::time::Instant::now() >= deadline);
+                                // The handler owns the oneshot receiver. If it
+                                // was cancelled (for example because the
+                                // caller disconnected or its gRPC timeout
+                                // elapsed), there is no useful result to send.
+                                // Drop the queued job before invoking the
+                                // classifier so cancelled work does not spend
+                                // model time. Dropping the job also releases
+                                // its admission permit.
+                                if job.respond.is_closed() {
+                                    current.fetch_sub(1, Ordering::SeqCst);
+                                    if expired {
+                                        metrics.record_queued_expired();
+                                    } else {
+                                        metrics.record_queued_cancelled();
+                                    }
+                                    drop(job);
+                                    continue;
+                                }
+                                if expired {
+                                    current.fetch_sub(1, Ordering::SeqCst);
+                                    metrics.record_queued_expired();
+                                    let _ = job.respond.send(Err(ClassifyError::RequestExpired));
+                                    continue;
+                                }
                                 metrics.record_stage(LatencyStage::Queue, job.queued_at.elapsed());
                                 let result = service.classify(job.input);
                                 let _ = job.respond.send(result);
@@ -202,6 +231,15 @@ impl<R: ClassifierRuntime + Send + Sync + 'static> InferenceExecutor<R> {
         &self,
         input: ClassificationInput,
     ) -> Result<oneshot::Receiver<Result<ClassificationResult, ClassifyError>>, QueueFull> {
+        self.try_enqueue_with_deadline(input, None)
+    }
+
+    /// Try to admit a classify job with an optional monotonic deadline.
+    pub fn try_enqueue_with_deadline(
+        &self,
+        input: ClassificationInput,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<oneshot::Receiver<Result<ClassificationResult, ClassifyError>>, QueueFull> {
         let (respond_tx, respond_rx) = oneshot::channel();
         // Acquire a permit for the total (in-flight + queued) bound; a full
         // bound rejects admission explicitly.
@@ -221,6 +259,7 @@ impl<R: ClassifierRuntime + Send + Sync + 'static> InferenceExecutor<R> {
         let job = InferenceJob {
             input,
             queued_at: std::time::Instant::now(),
+            deadline,
             respond: respond_tx,
             _permit: permit,
         };

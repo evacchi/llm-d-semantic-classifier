@@ -26,7 +26,9 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use crate::cache::{CacheKey, CachePath, SharedCache};
+use crate::cache::{
+    identity_tag, CacheKey, CachePath, NoopSemanticCache, SemanticCache, SharedCache,
+};
 use crate::metrics::{LatencyStage, Metrics};
 use crate::ranker::{anchor_rank, cosine_rank, AnchorSet, Prototype};
 use crate::taxonomy::ClassifierDefinition;
@@ -60,10 +62,66 @@ pub struct ClassificationInput {
     pub text: String,
     pub requested_signals: Vec<String>,
     pub session_metadata: HashMap<String, String>,
+    pub context_completeness: ContextCompleteness,
+}
+
+/// Whether the caller supplied complete semantic context or only a follow-up.
+///
+/// The gateway is authoritative for assembling conversation context. This
+/// marker lets the classifier decline a delta-only request safely without
+/// retaining durable session state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ContextCompleteness {
+    /// Legacy callers do not declare completeness; preserve existing behavior.
+    #[default]
+    Unspecified,
+    /// The supplied text contains complete context and can be classified.
+    Full,
+    /// The supplied text is only a follow-up and needs prior context.
+    Delta,
+}
+
+/// A classifier-produced embedding: the L2-normalized vector the ranker and the
+/// semantic cache both consume. Produced exactly once per classification so the
+/// (expensive) model forward is never repeated for a cache lookup.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Embedding {
+    pub vector: Vec<f32>,
+
+    /// Raw classifier logits, when the ModelCar ships a usable head.
+    ///
+    /// Carried HERE, on the embedding, because they come out of the same model
+    /// forward the vector does. The embed/rank split exists so that forward runs
+    /// at most once per classification; recomputing logits in `rank` would run it
+    /// twice and make every cache hit pay for a head it already had.
+    ///
+    /// `None` means the artifact is embedding-only and ranking falls back to
+    /// anchor cosine.
+    pub logits: Option<Vec<f32>>,
+}
+
+impl Embedding {
+    /// Wrap a raw embedding vector with no head output.
+    pub fn new(vector: Vec<f32>) -> Self {
+        Embedding {
+            vector,
+            logits: None,
+        }
+    }
+
+    /// Wrap an embedding together with the head's logits.
+    pub fn with_logits(vector: Vec<f32>, logits: Option<Vec<f32>>) -> Self {
+        Embedding { vector, logits }
+    }
+
+    /// The embedding dimension.
+    pub fn dim(&self) -> usize {
+        self.vector.len()
+    }
 }
 
 /// One ranked semantic signal: an id and its deterministic similarity score.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct RankedSignal {
     pub id: String,
     pub score: f64,
@@ -75,7 +133,7 @@ pub struct RankedSignal {
 /// (model/tokenizer/taxonomy) that reproduce the result, the ranked signals,
 /// and a [`ClassifyStatus`]. It NEVER contains a route/endpoint field — routing
 /// authority is the AI Gateway (AC-010).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ClassificationResult {
     pub classifier_id: String,
     pub model_revision: String,
@@ -90,7 +148,7 @@ pub struct ClassificationResult {
 /// `Ok` is a real ranked result; `Abstain` is "insufficient context where
 /// required — do not fabricate a label"; `Error` is an explicit failure (the
 /// typed error detail travels via [`ClassifyError`] on the `Result`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ClassifyStatus {
     Ok,
     Abstain,
@@ -139,8 +197,24 @@ impl std::error::Error for ClassifyError {}
 /// an explicit [`ClassifyError`]. The response is always semantic evidence,
 /// never a final route (AC-010).
 pub trait ClassifierRuntime {
-    /// Classify `input`, returning ranked semantic signals or an explicit error.
-    fn classify(&self, input: ClassificationInput) -> Result<ClassificationResult, ClassifyError>;
+    /// Embed `input` into its (L2-normalized) vector. This is the expensive
+    /// model-forward stage; it runs at most once per classification so a cache
+    /// lookup never repeats it.
+    fn embed(&self, input: &ClassificationInput) -> Result<Embedding, ClassifyError>;
+
+    /// Rank a previously-computed `embedding` into typed semantic evidence.
+    fn rank(
+        &self,
+        embedding: &Embedding,
+        input: &ClassificationInput,
+    ) -> Result<ClassificationResult, ClassifyError>;
+
+    /// Classify `input`: embed once, then rank. Backends inherit this; the
+    /// caching core overrides it to interpose the exact and semantic caches.
+    fn classify(&self, input: ClassificationInput) -> Result<ClassificationResult, ClassifyError> {
+        let embedding = self.embed(&input)?;
+        self.rank(&embedding, &input)
+    }
 
     /// The immutable identity of what this runtime actually loaded.
     ///
@@ -152,6 +226,29 @@ pub trait ClassifierRuntime {
     /// describe itself fixes all of them at once, and makes a second backend
     /// possible without teaching every caller about it.
     fn metadata(&self) -> RuntimeMetadata;
+}
+
+/// How a runtime turns an embedding into ranked signals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RankingMode {
+    /// The checkpoint's own trained classifier. Scores are softmax probabilities.
+    TrainedHead,
+    /// Cosine against taxonomy anchors. Used when the ModelCar ships no head.
+    ///
+    /// Measured BELOW the majority-class baseline on 3 of 5 signals (complexity
+    /// -2.54, cx2 -3.99, sensitivity -2.73): cosine-to-a-centroid is a rank-1
+    /// decision rule and cannot express those boundaries.
+    AnchorCosine,
+}
+
+impl RankingMode {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RankingMode::TrainedHead => "trained_head",
+            RankingMode::AnchorCosine => "anchor_cosine",
+        }
+    }
 }
 
 /// The immutable identity of a loaded classifier.
@@ -170,21 +267,45 @@ pub struct RuntimeMetadata {
     pub taxonomy_revision: String,
     /// Content digest of the resident artifact, when it was loaded from one.
     pub artifact_digest: Option<String>,
+
+    /// Which decision rule this runtime is actually using.
+    ///
+    /// Carried in metadata rather than left implicit because the two rules are
+    /// not close in quality: the trained head reproduces the checkpoint exactly,
+    /// while anchor cosine scores below a constant classifier on most signals.
+    /// Without this, an operator cannot tell from outside which one is live --
+    /// and the difference does not show up as an error, only as worse routing.
+    pub ranking_mode: RankingMode,
 }
 
 impl RuntimeMetadata {
     /// The identity components used to key the result cache. A change in ANY of
     /// them must produce a different key, so a stale classification can never be
     /// served across a revision or artifact change.
-    pub fn cache_identity(&self) -> (&str, &str, &str, &str) {
+    pub fn cache_identity(&self) -> (&str, &str, &str, &str, Option<&str>) {
         (
             &self.classifier_id,
-            self.artifact_digest
-                .as_deref()
-                .unwrap_or(&self.model_revision),
+            &self.model_revision,
             &self.tokenizer_revision,
             &self.taxonomy_revision,
+            self.artifact_digest.as_deref(),
         )
+    }
+}
+
+/// Build a provenance-preserving abstention without invoking a runtime backend.
+///
+/// A delta-only follow-up is not sufficient semantic input after disposable
+/// cache/session state is lost. The gateway must supply full context before the
+/// classifier can produce ranked evidence.
+fn insufficient_context_abstention(meta: RuntimeMetadata) -> ClassificationResult {
+    ClassificationResult {
+        classifier_id: meta.classifier_id,
+        model_revision: meta.model_revision,
+        tokenizer_revision: meta.tokenizer_revision,
+        taxonomy_revision: meta.taxonomy_revision,
+        status: ClassifyStatus::Abstain,
+        ranked: Vec::new(),
     }
 }
 
@@ -206,6 +327,14 @@ impl RuntimeMetadata {
 pub struct ServiceCore<R> {
     runtime: Arc<R>,
     cache: SharedCache,
+    semantic: Arc<dyn SemanticCache>,
+
+    /// L0: the approximate TEXT prefilter, consulted before the forward.
+    ///
+    /// Defaults to a no-op. See `cache::text` for why this tier is off unless
+    /// explicitly enabled: it can serve a result computed for a different prompt,
+    /// so it carries an error rate rather than merely a hit rate.
+    prefilter: Arc<dyn crate::cache::text::TextCache>,
     metrics: Metrics,
 }
 
@@ -220,11 +349,51 @@ where
 
     /// Build a service core whose cache and hit/miss/total/queue metrics record
     /// into the CALLER-SUPPLIED [`Metrics`] handle, so the backend's own
-    /// tokenize/forward stage recording can share the same registry.
+    /// tokenize/forward stage recording can share the same registry. The L2
+    /// semantic cache tier defaults to [`NoopSemanticCache`] (always misses),
+    /// so behaviour is UNCHANGED unless a semantic cache is opted into via
+    /// [`ServiceCore::with_semantic_cache`].
     pub fn with_metrics(runtime: R, metrics: Metrics) -> Self {
         ServiceCore {
             runtime: Arc::new(runtime),
             cache: SharedCache::new(),
+            semantic: Arc::new(NoopSemanticCache),
+            prefilter: Arc::new(crate::cache::text::NoopTextCache),
+            metrics,
+        }
+    }
+
+    /// Build a service core with an explicit L2 semantic cache tier.
+    pub fn with_semantic_cache(
+        runtime: R,
+        metrics: Metrics,
+        semantic: Arc<dyn SemanticCache>,
+    ) -> Self {
+        ServiceCore {
+            runtime: Arc::new(runtime),
+            cache: SharedCache::new(),
+            semantic,
+            prefilter: Arc::new(crate::cache::text::NoopTextCache),
+            metrics,
+        }
+    }
+
+    /// Build a service core with an explicit L0 text prefilter.
+    ///
+    /// Separate constructor rather than a field on the existing one: enabling an
+    /// APPROXIMATE tier that can serve another prompt's answer should be an
+    /// explicit act at the call site, not a default someone inherits.
+    pub fn with_text_prefilter(
+        runtime: R,
+        metrics: Metrics,
+        semantic: Arc<dyn SemanticCache>,
+        prefilter: Arc<dyn crate::cache::text::TextCache>,
+    ) -> Self {
+        ServiceCore {
+            runtime: Arc::new(runtime),
+            cache: SharedCache::new(),
+            semantic,
+            prefilter,
             metrics,
         }
     }
@@ -253,6 +422,20 @@ where
         self.runtime.metadata()
     }
 
+    /// Delegates to the wrapped runtime's `embed`.
+    fn embed(&self, input: &ClassificationInput) -> Result<Embedding, ClassifyError> {
+        self.runtime.embed(input)
+    }
+
+    /// Delegates to the wrapped runtime's `rank`.
+    fn rank(
+        &self,
+        embedding: &Embedding,
+        input: &ClassificationInput,
+    ) -> Result<ClassificationResult, ClassifyError> {
+        self.runtime.rank(embedding, input)
+    }
+
     /// Classify `input` through the shared core: versioned cache -> single-flight
     /// -> raw backend forward.
     ///
@@ -262,29 +445,74 @@ where
     /// versioned fingerprint, and the hit/miss/total/queue metrics are recorded
     /// here so EVERY backend inherits them.
     fn classify(&self, input: ClassificationInput) -> Result<ClassificationResult, ClassifyError> {
+        // A delta-only follow-up cannot be safely classified in isolation. This
+        // check deliberately precedes normalization, cache lookup, and raw
+        // runtime work: an exact-result/session cache is disposable acceleration,
+        // never authoritative conversation state.
+        if input.context_completeness == ContextCompleteness::Delta {
+            return Ok(insufficient_context_abstention(self.runtime.metadata()));
+        }
         let normalized = input.text.trim().to_string();
         // Key on the identity the WRAPPED RUNTIME reports, not on module
         // constants. Keying on constants meant every backend shared one
         // namespace: two taxonomies in one process would have collided, and a
         // revision change would have served the previous revision's answers.
         let meta = self.runtime.metadata();
-        let (classifier_id, model_rev, tokenizer_rev, taxonomy_rev) = meta.cache_identity();
-        let key = CacheKey::new(
+        let (classifier_id, model_rev, tokenizer_rev, taxonomy_rev, artifact_digest) =
+            meta.cache_identity();
+        let key = CacheKey::new_with_artifact_digest(
             classifier_id,
             model_rev,
             tokenizer_rev,
             taxonomy_rev,
             &normalized,
+            artifact_digest,
         );
+        // The L2 isolation tag is built from the SAME identity fields as the L1
+        // blake3 key, so a revision bump can never serve a stale semantic label.
+        let tag = identity_tag(meta.cache_identity());
         let metrics = self.metrics.clone();
         let forward = {
             let runtime = self.runtime.clone();
+            let semantic = self.semantic.clone();
+            let prefilter = self.prefilter.clone();
+            let tag = tag.clone();
             let input = ClassificationInput {
                 text: normalized,
                 requested_signals: input.requested_signals,
                 session_metadata: input.session_metadata,
+                context_completeness: input.context_completeness,
             };
-            move || runtime.classify(input)
+            move || {
+                // L0 (BEFORE the forward). This is the only tier whose hit
+                // avoids the model forward itself -- 30.72 ms p50, and 99.4% of
+                // request latency. L2 sits after `embed`, so its key IS the
+                // forward's output and a hit there saves only `rank`.
+                //
+                // The signature costs microseconds, so an L0 miss is nearly free
+                // and an L0 hit is worth ~30,000x its own cost. That inversion is
+                // the entire reason this tier exists.
+                let sig = crate::prefilter::signature(&input.text);
+                if let Some(hit) = prefilter.lookup(&sig, &tag) {
+                    return Ok(hit);
+                }
+                // Embed once. Reused by both the L2 lookup and the ranker.
+                let embedding = runtime.embed(&input)?;
+                // L2 semantic lookup (fail-open: None on any trouble). L2
+                // hit/miss/degraded metrics are recorded inside the cache.
+                if let Some(hit) = semantic.lookup(&embedding, &tag) {
+                    return Ok(hit);
+                }
+                // L2 miss: rank, then best-effort write-back.
+                let result = runtime.rank(&embedding, &input)?;
+                semantic.insert(&embedding, &result, &tag);
+                // Populate L0 from the SAME result. Writing here rather than on
+                // the L2 path means L0 only ever stores answers this process
+                // actually computed, never one L2 approximated -- approximating
+                // an approximation compounds error with nothing measuring it.
+                prefilter.insert(&sig, &result, &tag);
+                Ok(result)
+            }
         };
         let (result, path) = self.cache.classify_concurrent(key, forward);
         match path {
@@ -424,65 +652,6 @@ impl CandleClassifier {
         self.forward_calls.clone()
     }
 
-    /// Real Candle forward (tokenize + embed + rank) with the tokenize and
-    /// forward stages measured independently from their own boundaries (AC-012).
-    /// The runtime counters increment on every real tokenizer call / forward.
-    fn real_forward(&self, text: &str) -> Result<ClassificationResult, ClassifyError> {
-        // Tokenize stage (AC-012): independently measured.
-        let tokenize_start = std::time::Instant::now();
-        self.tokenizer_calls.fetch_add(1, Ordering::SeqCst);
-        let ids = self
-            .embedder
-            .tokenize(text)
-            .map_err(|e| ClassifyError::Embedding(e.to_string()))?;
-        self.metrics
-            .record_stage(LatencyStage::Tokenize, tokenize_start.elapsed());
-        // Forward stage (AC-012): the real embed + rank, independently measured.
-        let forward_start = std::time::Instant::now();
-        self.forward_calls.fetch_add(1, Ordering::SeqCst);
-        let embedding = self
-            .embedder
-            .embed_ids(ids)
-            .map_err(|e| ClassifyError::Embedding(e.to_string()))?;
-        let (ranked, identity) = match self.taxonomy.as_ref() {
-            Some(t) => (
-                anchor_rank(&embedding, &t.anchors, t.top_k),
-                (
-                    t.classifier_id.clone(),
-                    t.model_revision.clone(),
-                    t.taxonomy_revision.clone(),
-                ),
-            ),
-            None => (
-                cosine_rank(&embedding, &self.prototypes),
-                (
-                    CLASSIFIER_ID.to_string(),
-                    MODEL_REVISION.to_string(),
-                    TAXONOMY_REVISION.to_string(),
-                ),
-            ),
-        };
-        let tokenizer_revision = self
-            .taxonomy
-            .as_ref()
-            .map(|t| t.tokenizer_revision.clone())
-            .unwrap_or_else(|| TOKENIZER_REVISION.to_string());
-        let ranked = ranked
-            .into_iter()
-            .map(|(id, score)| RankedSignal { id, score })
-            .collect();
-        self.metrics
-            .record_stage(LatencyStage::Forward, forward_start.elapsed());
-        Ok(ClassificationResult {
-            classifier_id: identity.0,
-            model_revision: identity.1,
-            tokenizer_revision,
-            taxonomy_revision: identity.2,
-            status: ClassifyStatus::Ok,
-            ranked,
-        })
-    }
-
     /// Build the classifier from the resident ModelCar directory, ranking
     /// against the classifier definition selected by the environment
     /// (`LLM_D_SC_CLASSIFIER`, default `complexity`). The definition may name a
@@ -512,9 +681,11 @@ impl CandleClassifier {
         // classifier's identity. It was previously computed during warmup and
         // then discarded, so the provenance it was meant to provide never
         // reached a result or a cache key.
-        let digest =
-            crate::runtime::modelcar_digest(model_dir, crate::runtime::MODELCAR_REQUIRED_FILES)
-                .ok();
+        let digest = crate::runtime::modelcar_digest(
+            model_dir,
+            crate::runtime::modelcar_required_files(model_dir),
+        )
+        .ok();
         CandleClassifier::with_taxonomy_and_digest(embedder, definition, Metrics::new(), digest)
     }
 }
@@ -548,6 +719,7 @@ impl ClassifierRuntime for CandleClassifier {
                 tokenizer_revision: t.tokenizer_revision.clone(),
                 taxonomy_revision: t.taxonomy_revision.clone(),
                 artifact_digest: t.artifact_digest.clone(),
+                ranking_mode: self.ranking_mode(),
             },
             // The weight-free synthetic path, used only by tests.
             None => RuntimeMetadata {
@@ -556,21 +728,178 @@ impl ClassifierRuntime for CandleClassifier {
                 model_revision: MODEL_REVISION.to_string(),
                 tokenizer_revision: TOKENIZER_REVISION.to_string(),
                 taxonomy_revision: TAXONOMY_REVISION.to_string(),
+                // The synthetic path has no checkpoint, so no head.
+                ranking_mode: RankingMode::AnchorCosine,
                 artifact_digest: None,
             },
         }
     }
 
-    /// Classify `input`, returning ranked semantic signals from the ACTUAL
-    /// embedding.
+    /// Embed `input` with the real Candle tokenizer + model forward, with the
+    /// tokenize and forward stages measured independently from their own
+    /// boundaries (AC-012). The runtime counters increment on every real
+    /// tokenizer call / forward. There is NO cache or single-flight logic
+    /// here — the generic [`ServiceCore`] that wraps this backend provides
+    /// them, so a cache hit through the core never reaches this stage (AC-006).
+    fn embed(&self, input: &ClassificationInput) -> Result<Embedding, ClassifyError> {
+        let text = input.text.trim();
+        // Tokenize stage (AC-012): independently measured.
+        let tokenize_start = std::time::Instant::now();
+        self.tokenizer_calls.fetch_add(1, Ordering::SeqCst);
+        let ids = self
+            .embedder
+            .tokenize(text)
+            .map_err(|e| ClassifyError::Embedding(e.to_string()))?;
+        self.metrics
+            .record_stage(LatencyStage::Tokenize, tokenize_start.elapsed());
+        // Forward stage (AC-012): the real model forward.
+        let forward_start = std::time::Instant::now();
+        self.forward_calls.fetch_add(1, Ordering::SeqCst);
+        let (vector, logits) = self
+            .embedder
+            .embed_and_classify(ids)
+            .map_err(|e| ClassifyError::Embedding(e.to_string()))?;
+        self.metrics
+            .record_stage(LatencyStage::Forward, forward_start.elapsed());
+        Ok(Embedding::with_logits(vector, logits))
+    }
+
+    /// Rank a previously-computed embedding against the resident taxonomy (or
+    /// the synthetic fallback). No tokenizer/forward counters increment here —
+    /// they belong to the embed stage.
+    fn rank(
+        &self,
+        embedding: &Embedding,
+        _input: &ClassificationInput,
+    ) -> Result<ClassificationResult, ClassifyError> {
+        let v = &embedding.vector;
+
+        // HEAD FIRST when the artifact ships one. Anchor cosine ranks BELOW the
+        // majority-class baseline on 3 of 5 measured signals (complexity -2.54,
+        // cx2 -3.99, sensitivity -2.73) because cosine-to-a-centroid is a rank-1
+        // rule; the trained head on the same vectors is worth +16.31 on
+        // complexity. The anchor path remains for embedding-only ModelCars, which
+        // are legitimate artifacts, not a legacy mode.
+        if let (Some(logits), Some(labels)) = (embedding.logits.as_ref(), self.embedder.labels()) {
+            if logits.len() == labels.len() {
+                return self.rank_from_head(logits, labels);
+            }
+            // A head whose width disagrees with its label map cannot be
+            // interpreted at all: column i would name the wrong class. Fall
+            // through to anchors rather than emit confident mislabels.
+        }
+
+        let (ranked, identity) = match self.taxonomy.as_ref() {
+            Some(t) => (
+                anchor_rank(v, &t.anchors, t.top_k),
+                (
+                    t.classifier_id.clone(),
+                    t.model_revision.clone(),
+                    t.taxonomy_revision.clone(),
+                ),
+            ),
+            None => (
+                cosine_rank(v, &self.prototypes),
+                (
+                    CLASSIFIER_ID.to_string(),
+                    MODEL_REVISION.to_string(),
+                    TAXONOMY_REVISION.to_string(),
+                ),
+            ),
+        };
+        let tokenizer_revision = self
+            .taxonomy
+            .as_ref()
+            .map(|t| t.tokenizer_revision.clone())
+            .unwrap_or_else(|| TOKENIZER_REVISION.to_string());
+        let ranked = ranked
+            .into_iter()
+            .map(|(id, score)| RankedSignal { id, score })
+            .collect();
+        Ok(ClassificationResult {
+            classifier_id: identity.0,
+            model_revision: identity.1,
+            tokenizer_revision,
+            taxonomy_revision: identity.2,
+            status: ClassifyStatus::Ok,
+            ranked,
+        })
+    }
+}
+
+impl CandleClassifier {
+    /// Which decision rule this classifier will actually use.
     ///
-    /// RAW backend forward: tokenize + embed + rank, with the tokenize/forward
-    /// stages measured (AC-012). There is NO cache, single-flight, or hit/miss
-    /// logic here — the generic [`ServiceCore`] that wraps this backend provides
-    /// them, so a cache hit through the core never reaches this forward (AC-006).
-    fn classify(&self, input: ClassificationInput) -> Result<ClassificationResult, ClassifyError> {
-        let normalized = input.text.trim().to_string();
-        self.real_forward(&normalized)
+    /// Derived from what the ModelCar loaded, not from configuration: the head
+    /// is used whenever the checkpoint ships a usable one, and there is no flag
+    /// to turn it off. A deployment that wants anchor ranking gets it by serving
+    /// an embedding-only artifact, which is an honest statement of what it has.
+    #[must_use]
+    pub fn ranking_mode(&self) -> RankingMode {
+        match self.embedder.labels() {
+            Some(_) => RankingMode::TrainedHead,
+            None => RankingMode::AnchorCosine,
+        }
+    }
+
+    /// Rank from the trained classification head.
+    ///
+    /// Scores are SOFTMAX PROBABILITIES, not raw logits and not cosine
+    /// similarities. That distinction is load-bearing: this service previously
+    /// emitted negative-capable cosine similarities as if they were scores, and
+    /// because argmax survives any monotone transform the accuracy looked right
+    /// while every calibration, risk-coverage and abstention threshold computed
+    /// downstream ran on nonsense. A score leaving here is a probability.
+    fn rank_from_head(
+        &self,
+        logits: &[f32],
+        labels: &[String],
+    ) -> Result<ClassificationResult, ClassifyError> {
+        let probs = crate::head::softmax(logits);
+        let mut ranked: Vec<RankedSignal> = labels
+            .iter()
+            .zip(probs.iter())
+            .map(|(id, p)| RankedSignal {
+                id: id.clone(),
+                score: f64::from(*p),
+            })
+            .collect();
+        // Descending by score; ties broken by label so the order is stable
+        // across runs and a golden comparison does not flap.
+        ranked.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        if let Some(t) = self.taxonomy.as_ref() {
+            if t.top_k > 0 && ranked.len() > t.top_k {
+                ranked.truncate(t.top_k);
+            }
+        }
+        let (classifier_id, model_revision, taxonomy_revision, tokenizer_revision) =
+            match self.taxonomy.as_ref() {
+                Some(t) => (
+                    t.classifier_id.clone(),
+                    t.model_revision.clone(),
+                    t.taxonomy_revision.clone(),
+                    t.tokenizer_revision.clone(),
+                ),
+                None => (
+                    CLASSIFIER_ID.to_string(),
+                    MODEL_REVISION.to_string(),
+                    TAXONOMY_REVISION.to_string(),
+                    TOKENIZER_REVISION.to_string(),
+                ),
+            };
+        Ok(ClassificationResult {
+            classifier_id,
+            model_revision,
+            tokenizer_revision,
+            taxonomy_revision,
+            status: ClassifyStatus::Ok,
+            ranked,
+        })
     }
 }
 
@@ -597,7 +926,10 @@ pub fn load_and_warm_modelcar<P: AsRef<std::path::Path>>(
     // before any load.
     let mut runtime = crate::runtime::Runtime::new();
     runtime
-        .warmup_modelcar(model_dir, crate::runtime::MODELCAR_REQUIRED_FILES)
+        .warmup_modelcar(
+            model_dir,
+            crate::runtime::modelcar_required_files(model_dir),
+        )
         .map_err(ClassifyError::Unavailable)?;
     // (2) Load tokenizer + config + safetensors and build the real classifier.
     let classifier = CandleClassifier::from_modelcar(model_dir)?;
@@ -606,6 +938,7 @@ pub fn load_and_warm_modelcar<P: AsRef<std::path::Path>>(
         text: WARMUP_INPUT.to_string(),
         requested_signals: vec!["sensitivity".to_string()],
         session_metadata: HashMap::new(),
+        context_completeness: ContextCompleteness::Full,
     };
     classifier
         .classify(warmup_input)
@@ -675,13 +1008,31 @@ impl ClassifyService {
         let prototypes = load_prototypes(root.join("synthetic-prototypes.json"));
         (tokenizer, prototypes)
     }
+}
 
-    /// Deterministic tokenize + rank: tokenize with the resident tokenizer,
-    /// build a deterministic pseudo-embedding from the token IDs, and cosine-rank
-    /// against the synthetic prototypes. No model forward. A tokenization
-    /// failure is an explicit [`ClassifyError::Tokenizer`] — never a fabricated
-    /// label (spec failure contract).
-    fn deterministic_classify(&self, context: &str) -> Result<ClassificationResult, ClassifyError> {
+impl ClassifierRuntime for ClassifyService {
+    fn metadata(&self) -> RuntimeMetadata {
+        RuntimeMetadata {
+            // Synthetic prototypes, never a trained head.
+            ranking_mode: RankingMode::AnchorCosine,
+            classifier_id: CLASSIFIER_ID.to_string(),
+            signal: "sensitivity".to_string(),
+            model_revision: MODEL_REVISION.to_string(),
+            tokenizer_revision: TOKENIZER_REVISION.to_string(),
+            taxonomy_revision: TAXONOMY_REVISION.to_string(),
+            artifact_digest: None,
+        }
+    }
+
+    /// Embed `input`: tokenize with the resident tokenizer and build a
+    /// deterministic pseudo-embedding from the token IDs. No model forward. A
+    /// tokenization failure is an explicit [`ClassifyError::Tokenizer`] — never
+    /// a fabricated label (spec failure contract). There is NO cache or
+    /// single-flight logic here — the generic [`ServiceCore`] that wraps this
+    /// backend provides them, so a cache hit through the core never reaches
+    /// this stage (AC-006).
+    fn embed(&self, input: &ClassificationInput) -> Result<Embedding, ClassifyError> {
+        let context = input.text.trim();
         // Tokenize stage (AC-012): independently measured.
         let tokenize_start = std::time::Instant::now();
         let ids = self
@@ -690,14 +1041,25 @@ impl ClassifyService {
             .map_err(|e| ClassifyError::Tokenizer(e.to_string()))?;
         self.metrics
             .record_stage(LatencyStage::Tokenize, tokenize_start.elapsed());
-        // Forward stage (AC-012): the deterministic embed + rank, independently
+        let mut vector = vec![0.0f32; SYNTHETIC_DIM];
+        for id in ids {
+            vector[(id as usize) % SYNTHETIC_DIM] += 1.0;
+        }
+        Ok(Embedding::new(vector))
+    }
+
+    /// Rank a previously-computed embedding by cosine similarity against the
+    /// synthetic prototypes. No tokenizer counters here — they belong to the
+    /// embed stage.
+    fn rank(
+        &self,
+        embedding: &Embedding,
+        _input: &ClassificationInput,
+    ) -> Result<ClassificationResult, ClassifyError> {
+        // Forward stage (AC-012): the deterministic rank, independently
         // measured from the tokenize boundary.
         let forward_start = std::time::Instant::now();
-        let mut embedding = vec![0.0f32; SYNTHETIC_DIM];
-        for id in ids {
-            embedding[(id as usize) % SYNTHETIC_DIM] += 1.0;
-        }
-        let ranked = cosine_rank(&embedding, &self.prototypes)
+        let ranked = cosine_rank(&embedding.vector, &self.prototypes)
             .into_iter()
             .map(|(id, score)| RankedSignal { id, score })
             .collect();
@@ -711,31 +1073,6 @@ impl ClassifyService {
             status: ClassifyStatus::Ok,
             ranked,
         })
-    }
-}
-
-impl ClassifierRuntime for ClassifyService {
-    fn metadata(&self) -> RuntimeMetadata {
-        RuntimeMetadata {
-            classifier_id: CLASSIFIER_ID.to_string(),
-            signal: "sensitivity".to_string(),
-            model_revision: MODEL_REVISION.to_string(),
-            tokenizer_revision: TOKENIZER_REVISION.to_string(),
-            taxonomy_revision: TAXONOMY_REVISION.to_string(),
-            artifact_digest: None,
-        }
-    }
-
-    /// Classify `input`, returning ranked semantic signals.
-    ///
-    /// RAW backend forward: deterministic tokenize + rank over the synthetic
-    /// prototypes, with the tokenize/forward stages measured (AC-012). There is
-    /// NO cache, single-flight, or hit/miss logic here — the generic
-    /// [`ServiceCore`] that wraps this backend provides them, so a cache hit
-    /// through the core never reaches this forward (AC-006).
-    fn classify(&self, input: ClassificationInput) -> Result<ClassificationResult, ClassifyError> {
-        let normalized = input.text.trim().to_string();
-        self.deterministic_classify(&normalized)
     }
 }
 
@@ -792,6 +1129,7 @@ mod tests {
             text: "this is a golden sensitivity input".to_string(),
             requested_signals: vec!["sensitivity".to_string()],
             session_metadata: HashMap::from([("session_id".to_string(), "sess-0001".to_string())]),
+            context_completeness: ContextCompleteness::Full,
         };
         let result = service.classify(input).expect("golden input must classify");
         assert_eq!(result.status, ClassifyStatus::Ok);
@@ -825,12 +1163,58 @@ mod tests {
             text: "this is a golden sensitivity input".to_string(),
             requested_signals: vec!["sensitivity".to_string()],
             session_metadata: HashMap::new(),
+            context_completeness: ContextCompleteness::Full,
         };
         let first = core.classify(input.clone()).expect("first classify");
         let second = core.classify(input).expect("second classify");
         assert_eq!(
             first, second,
             "identical inputs must produce identical results"
+        );
+    }
+
+    /// U-048: a delta-only follow-up must not be classified as standalone
+    /// context. It abstains before interacting with the exact-result cache or
+    /// invoking the raw classifier.
+    #[test]
+    fn u048_delta_context_abstains_without_forward_or_cache_access() {
+        let metrics = Metrics::new();
+        let core =
+            ServiceCore::with_metrics(ClassifyService::from_synthetic_fixtures(), metrics.clone());
+        let result = core
+            .classify(ClassificationInput {
+                text: "do that again".to_string(),
+                requested_signals: vec!["sensitivity".to_string()],
+                session_metadata: HashMap::from([(
+                    "session_id".to_string(),
+                    "sess-delta".to_string(),
+                )]),
+                context_completeness: ContextCompleteness::Delta,
+            })
+            .expect("delta context must return a typed abstention");
+
+        assert_eq!(result.status, ClassifyStatus::Abstain);
+        assert!(
+            result.ranked.is_empty(),
+            "abstention must not fabricate a label"
+        );
+        assert_eq!(
+            core.forward_count(),
+            0,
+            "delta context must not invoke a raw forward"
+        );
+        let snapshot = metrics.snapshot();
+        assert_eq!(
+            snapshot.cache_hits, 0,
+            "delta context must not read the cache"
+        );
+        assert_eq!(
+            snapshot.cache_misses, 0,
+            "delta context must not populate the cache"
+        );
+        assert_eq!(
+            snapshot.cache_coalesced, 0,
+            "delta context must not join a cache flight"
         );
     }
 
@@ -853,6 +1237,7 @@ mod tests {
             text: "this is a golden sensitivity input".to_string(),
             requested_signals: vec!["sensitivity".to_string()],
             session_metadata: HashMap::new(),
+            context_completeness: ContextCompleteness::Full,
         };
         let result = classifier
             .classify(input)
@@ -892,6 +1277,7 @@ mod tests {
             text: WARMUP_INPUT.to_string(),
             requested_signals: vec!["sensitivity".to_string()],
             session_metadata: HashMap::new(),
+            context_completeness: ContextCompleteness::Full,
         };
 
         // Miss: exactly one tokenizer call and one model forward.
@@ -928,6 +1314,7 @@ mod tests {
             text: "a distinct sensitivity context for a fresh miss".to_string(),
             requested_signals: vec!["sensitivity".to_string()],
             session_metadata: HashMap::new(),
+            context_completeness: ContextCompleteness::Full,
         };
         core.classify(other).expect("distinct input must classify");
         assert_eq!(
@@ -958,5 +1345,120 @@ mod tests {
             Err(other) => panic!("must be an actionable unavailable error, got {other:?}"),
         }
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn embedding_reports_its_dimension() {
+        let e = Embedding::new(vec![0.0, 1.0, 0.0]);
+        assert_eq!(e.dim(), 3);
+        assert_eq!(e.vector, vec![0.0, 1.0, 0.0]);
+    }
+
+    /// A spy [`crate::cache::SemanticCache`] proves an L1 miss consults the L2
+    /// tier exactly once, and an L2 hit is served verbatim WITHOUT invoking the
+    /// ranker.
+    #[test]
+    fn service_core_serves_semantic_hit_without_ranking() {
+        use crate::cache::SemanticCache;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc as StdArc;
+
+        struct SpyCache {
+            canned: ClassificationResult,
+            lookups: StdArc<AtomicUsize>,
+        }
+        impl SemanticCache for SpyCache {
+            fn lookup(&self, _e: &Embedding, _id: &str) -> Option<ClassificationResult> {
+                self.lookups.fetch_add(1, Ordering::SeqCst);
+                Some(self.canned.clone())
+            }
+            fn insert(&self, _e: &Embedding, _r: &ClassificationResult, _id: &str) {}
+        }
+
+        let canned = ClassificationResult {
+            classifier_id: "spy".into(),
+            model_revision: "m".into(),
+            tokenizer_revision: "t".into(),
+            taxonomy_revision: "x".into(),
+            status: ClassifyStatus::Ok,
+            ranked: vec![RankedSignal {
+                id: "SEMANTIC_HIT".into(),
+                score: 0.99,
+            }],
+        };
+        let lookups = StdArc::new(AtomicUsize::new(0));
+        let spy = StdArc::new(SpyCache {
+            canned: canned.clone(),
+            lookups: lookups.clone(),
+        });
+
+        let core = ServiceCore::with_semantic_cache(
+            ClassifyService::from_synthetic_fixtures(),
+            Metrics::new(),
+            spy,
+        );
+        let input = ClassificationInput {
+            text: "some novel prompt not seen before".to_string(),
+            requested_signals: vec!["sensitivity".to_string()],
+            session_metadata: HashMap::new(),
+            context_completeness: ContextCompleteness::Full,
+        };
+        let out = core.classify(input).expect("classify");
+        assert_eq!(
+            lookups.load(Ordering::SeqCst),
+            1,
+            "L1 miss must consult L2 once"
+        );
+        assert_eq!(
+            out.ranked[0].id, "SEMANTIC_HIT",
+            "L2 hit must be served verbatim"
+        );
+    }
+
+    /// The default [`ServiceCore`] (Noop L2) must remain unaffected: an L1 miss
+    /// with a Noop L2 always misses, so it must run exactly one embed and one
+    /// rank, reproducing the pre-L2 behaviour byte-for-byte.
+    #[test]
+    fn service_core_noop_default_is_unaffected() {
+        let core =
+            ServiceCore::with_metrics(ClassifyService::from_synthetic_fixtures(), Metrics::new());
+        let input = ClassificationInput {
+            text: "this is a golden sensitivity input".to_string(),
+            requested_signals: vec!["sensitivity".to_string()],
+            session_metadata: HashMap::new(),
+            context_completeness: ContextCompleteness::Full,
+        };
+        let via_core = core.classify(input.clone()).expect("core classify");
+        let direct = ClassifyService::from_synthetic_fixtures()
+            .classify(input)
+            .expect("direct classify");
+        assert_eq!(
+            via_core, direct,
+            "default Noop L2 must not change the classification result"
+        );
+    }
+
+    /// The `embed`/`rank` split must reproduce the provided `classify` default
+    /// exactly on the synthetic path, and `embed` must be independently callable
+    /// (a later cache tier interposes here).
+    #[test]
+    fn embed_then_rank_matches_classify_on_synthetic() {
+        let svc = ClassifyService::from_synthetic_fixtures();
+        let input = ClassificationInput {
+            text: "this is a golden sensitivity input".to_string(),
+            requested_signals: vec!["sensitivity".to_string()],
+            session_metadata: HashMap::new(),
+            context_completeness: ContextCompleteness::Full,
+        };
+        // Two-stage path.
+        let embedding = svc.embed(&input).expect("embed");
+        assert_eq!(embedding.dim(), SYNTHETIC_DIM);
+        let staged = svc.rank(&embedding, &input).expect("rank");
+        // Provided classify() default must produce the identical result.
+        let one_shot = svc.classify(input).expect("classify");
+        assert_eq!(
+            staged, one_shot,
+            "embed+rank must equal the provided classify"
+        );
     }
 }

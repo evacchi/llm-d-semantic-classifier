@@ -22,6 +22,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::classify::ClassifyError;
 use crate::handoff::InferenceExecutor;
@@ -42,6 +43,42 @@ pub mod generated {
 }
 
 pub use generated::{ClassifyRequest, ClassifyResponse};
+
+#[derive(Clone, Copy)]
+struct RequestDeadline(Instant);
+
+fn request_deadline<T>(request: &tonic::Request<T>) -> Option<Instant> {
+    if let Some(deadline) = request.extensions().get::<RequestDeadline>() {
+        return Some(deadline.0);
+    }
+
+    request
+        .metadata()
+        .get("grpc-timeout")
+        .and_then(|value| value.to_str().ok())
+        .and_then(parse_grpc_timeout)
+        .and_then(|timeout| Instant::now().checked_add(timeout))
+}
+
+fn parse_grpc_timeout(value: &str) -> Option<Duration> {
+    if value.len() < 2 {
+        return None;
+    }
+    let (number, unit) = value.split_at(value.len() - 1);
+    if number.is_empty() || number.len() > 8 {
+        return None;
+    }
+    let value = number.parse::<u64>().ok()?;
+    match unit {
+        "H" => Some(Duration::from_secs(value.checked_mul(60 * 60)?)),
+        "M" => Some(Duration::from_secs(value.checked_mul(60)?)),
+        "S" => Some(Duration::from_secs(value)),
+        "m" => Some(Duration::from_millis(value)),
+        "u" => Some(Duration::from_micros(value)),
+        "n" => Some(Duration::from_nanos(value)),
+        _ => None,
+    }
+}
 
 /// The generated tonic (async) service trait.
 pub use generated::classify_server::Classify as ClassifyTrait;
@@ -128,6 +165,27 @@ where
         }
     }
 
+    /// Like [`ClassifyServiceImpl::with_executor`] but wraps the backend in a
+    /// [`crate::classify::ServiceCore`] carrying an explicit L2 semantic cache
+    /// tier (production opt-in). The synthetic/test paths keep using
+    /// `with_executor` (Noop L2).
+    pub fn with_executor_and_cache(
+        service: R,
+        telemetry: Telemetry,
+        metrics: Metrics,
+        bound: usize,
+        semantic: Arc<dyn crate::cache::SemanticCache>,
+    ) -> Self {
+        let core =
+            crate::classify::ServiceCore::with_semantic_cache(service, metrics.clone(), semantic);
+        let executor = InferenceExecutor::spawn(core, metrics.clone(), bound);
+        Self {
+            telemetry,
+            metrics,
+            executor: Arc::new(executor),
+        }
+    }
+
     /// The configured bound on total admitted (in-flight + queued) work.
     pub fn queue_bound(&self) -> usize {
         self.executor.bound()
@@ -149,6 +207,7 @@ where
         &self,
         request: tonic::Request<generated::ClassifyRequest>,
     ) -> Result<tonic::Response<generated::ClassifyResponse>, tonic::Status> {
+        let deadline = request_deadline(&request);
         let req = request.into_inner();
         // AC-014: record request telemetry with the context/session hashed, so
         // default telemetry and trace capture never carry raw prompt/session text.
@@ -183,6 +242,19 @@ where
             text: req.context,
             requested_signals: req.signals,
             session_metadata: HashMap::from([("session_id".to_string(), req.session_id)]),
+            context_completeness: match generated::ContextCompleteness::try_from(
+                req.context_completeness,
+            )
+            .unwrap_or(generated::ContextCompleteness::Unspecified)
+            {
+                generated::ContextCompleteness::Full => crate::classify::ContextCompleteness::Full,
+                generated::ContextCompleteness::Delta => {
+                    crate::classify::ContextCompleteness::Delta
+                }
+                generated::ContextCompleteness::Unspecified => {
+                    crate::classify::ContextCompleteness::Unspecified
+                }
+            },
         };
         // AC-008 / ADR-0002: hand the job to the dedicated inference executor
         // over a BOUNDED handoff. The model forward does NOT run on this Tokio
@@ -190,7 +262,7 @@ where
         // resource_exhausted (never unboundedly buffered).
         let respond = self
             .executor
-            .try_enqueue(input)
+            .try_enqueue_with_deadline(input, deadline)
             .map_err(|_| tonic::Status::resource_exhausted("inference queue is full"))?;
         // Await the dedicated executor's forward result (returned via oneshot).
         let result = respond
@@ -206,6 +278,9 @@ where
                 return Err(match e {
                     ClassifyError::ResourceExhausted => {
                         tonic::Status::resource_exhausted("inference queue is full")
+                    }
+                    ClassifyError::RequestExpired => {
+                        tonic::Status::deadline_exceeded("request deadline expired")
                     }
                     _ => tonic::Status::unavailable(e.to_string()),
                 })
@@ -316,11 +391,62 @@ impl ClassifyServer {
         // real Candle forward are visible to a benchmark harness (AC-012).
         let metrics = classifier.metrics();
         let telemetry = Telemetry::new();
-        let service = ClassifyServiceImpl::with_executor(
+        // Select the L2 cache strategy from the environment (off by default:
+        // `LLM_D_SC_CACHE` unset resolves to "exact", i.e. Noop). Any
+        // misconfiguration or a Redis that cannot be reached falls back to
+        // the exact-only cache rather than failing to start (fail-open).
+        let cache_cfg = crate::config::CacheConfig::from_env().unwrap_or_else(|e| {
+            eprintln!("llm-d-sc: invalid cache config ({e:?}); falling back to exact cache");
+            crate::config::CacheConfig {
+                strategy: "exact".into(),
+                redis_url: None,
+                threshold: 0.90,
+                ttl_secs: 86_400,
+                timeout_ms: 50,
+            }
+        });
+        let semantic: Arc<dyn crate::cache::SemanticCache> = if cache_cfg.strategy
+            == "redis-semantic"
+        {
+            #[cfg(feature = "redis-semantic")]
+            {
+                match crate::cache::redis::RedisSemanticCache::connect(&cache_cfg, metrics.clone())
+                {
+                    Ok(rc) => {
+                        eprintln!(
+                            "llm-d-sc: semantic cache enabled (redis-semantic, threshold {})",
+                            cache_cfg.threshold
+                        );
+                        Arc::new(rc)
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "llm-d-sc: redis-semantic unavailable ({e}); falling back to exact cache"
+                        );
+                        Arc::new(crate::cache::NoopSemanticCache)
+                    }
+                }
+            }
+            // Built without the `redis-semantic` feature: the strategy was
+            // requested but the backend is not compiled in. Fail open to the
+            // exact-only cache rather than refusing to start.
+            #[cfg(not(feature = "redis-semantic"))]
+            {
+                eprintln!(
+                    "llm-d-sc: LLM_D_SC_CACHE=redis-semantic requested but this binary was \
+                     built without the `redis-semantic` feature; falling back to exact cache"
+                );
+                Arc::new(crate::cache::NoopSemanticCache)
+            }
+        } else {
+            Arc::new(crate::cache::NoopSemanticCache)
+        };
+        let service = ClassifyServiceImpl::with_executor_and_cache(
             classifier,
             telemetry.clone(),
             metrics.clone(),
             DEFAULT_QUEUE_BOUND,
+            semantic,
         );
         Self::serve(
             addr,
@@ -367,7 +493,22 @@ impl ClassifyServer {
         let incoming = tokio_stream::StreamExt::map(
             tokio_stream::wrappers::TcpListenerStream::new(listener),
             move |conn| {
-                if conn.is_ok() {
+                if let Ok(ref stream) = conn {
+                    // Disable Nagle on every ACCEPTED connection.
+                    //
+                    // `Server::builder().tcp_nodelay(..)` only applies when tonic
+                    // owns the listener; with `serve_with_incoming` (used here so
+                    // accepted connections can be counted for I-008) tonic never
+                    // touches the socket, so accepted sockets keep Nagle on.
+                    //
+                    // The symptom is unmistakable and expensive: a small fraction
+                    // of responses stall on the peer's 40 ms delayed-ACK timer, so
+                    // the latency distribution is bimodal -- ~0.28 ms for most
+                    // requests and a hard cluster at 40-42 ms with essentially
+                    // nothing in between. That tail alone set p99 for the whole
+                    // service. `ClassifyClient::connect` already sets nodelay on
+                    // the client side; this is the missing server half.
+                    let _ = stream.set_nodelay(true);
                     accept_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 }
                 conn
@@ -482,5 +623,28 @@ impl ClassifyClient {
         let mut client = generated::classify_client::ClassifyClient::new(self.channel.clone());
         let response = self.runtime.block_on(client.classify(request))?;
         Ok(response.into_inner())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_grpc_timeout;
+    use std::time::Duration;
+
+    #[test]
+    fn parses_grpc_timeout_units() {
+        assert_eq!(parse_grpc_timeout("1S"), Some(Duration::from_secs(1)));
+        assert_eq!(parse_grpc_timeout("250m"), Some(Duration::from_millis(250)));
+        assert_eq!(parse_grpc_timeout("10u"), Some(Duration::from_micros(10)));
+        assert_eq!(parse_grpc_timeout("10n"), Some(Duration::from_nanos(10)));
+    }
+
+    #[test]
+    fn rejects_invalid_grpc_timeout_values() {
+        assert_eq!(parse_grpc_timeout(""), None);
+        assert_eq!(parse_grpc_timeout("1"), None);
+        assert_eq!(parse_grpc_timeout("1x"), None);
+        assert_eq!(parse_grpc_timeout("123456789S"), None);
+        assert_eq!(parse_grpc_timeout("abcS"), None);
     }
 }

@@ -12,12 +12,12 @@
 //! them. It fails against a single-threaded executor.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
 use llm_d_sc::classify::{
     ClassificationInput, ClassificationResult, ClassifierRuntime, ClassifyError, ClassifyStatus,
-    RankedSignal, RuntimeMetadata,
+    Embedding, RankedSignal, RuntimeMetadata,
 };
 use llm_d_sc::handoff::InferenceExecutor;
 use llm_d_sc::metrics::Metrics;
@@ -42,7 +42,22 @@ impl ClassifierRuntime for SlowClassifier {
             tokenizer_revision: "test".into(),
             taxonomy_revision: "test".into(),
             artifact_digest: None,
+            ranking_mode: llm_d_sc::classify::RankingMode::AnchorCosine,
         }
+    }
+
+    // This test double overrides `classify` directly to control the forward
+    // delay and concurrency bookkeeping; `embed`/`rank` are never reached.
+    fn embed(&self, _input: &ClassificationInput) -> Result<Embedding, ClassifyError> {
+        unimplemented!("SlowClassifier overrides classify directly")
+    }
+
+    fn rank(
+        &self,
+        _embedding: &Embedding,
+        _input: &ClassificationInput,
+    ) -> Result<ClassificationResult, ClassifyError> {
+        unimplemented!("SlowClassifier overrides classify directly")
     }
 
     fn classify(&self, _input: ClassificationInput) -> Result<ClassificationResult, ClassifyError> {
@@ -87,6 +102,7 @@ fn i090_executor_workers_run_forwards_in_parallel() {
                     text: format!("job {i}"),
                     requested_signals: vec!["sensitivity".into()],
                     session_metadata: Default::default(),
+                    context_completeness: Default::default(),
                 })
                 .expect("bound of 32 must admit 4 jobs")
         })
@@ -137,6 +153,7 @@ fn i091_single_worker_executor_is_observably_serial() {
                     text: format!("job {i}"),
                     requested_signals: vec!["sensitivity".into()],
                     session_metadata: Default::default(),
+                    context_completeness: Default::default(),
                 })
                 .expect("must admit")
         })
@@ -154,4 +171,193 @@ fn i091_single_worker_executor_is_observably_serial() {
         1,
         "a single-worker executor must never run two forwards at once"
     );
+}
+
+struct CancellationClassifier {
+    calls: Arc<AtomicUsize>,
+    first_started: Arc<Barrier>,
+    release_first: Arc<Barrier>,
+}
+
+impl ClassifierRuntime for CancellationClassifier {
+    // This test double overrides `classify` directly to drive the barriers;
+    // `embed`/`rank` are never reached.
+    fn embed(&self, _input: &ClassificationInput) -> Result<Embedding, ClassifyError> {
+        unimplemented!("CancellationClassifier overrides classify directly")
+    }
+
+    fn rank(
+        &self,
+        _embedding: &Embedding,
+        _input: &ClassificationInput,
+    ) -> Result<ClassificationResult, ClassifyError> {
+        unimplemented!("CancellationClassifier overrides classify directly")
+    }
+
+    fn metadata(&self) -> RuntimeMetadata {
+        RuntimeMetadata {
+            classifier_id: "test-cancellation".into(),
+            signal: "sensitivity".into(),
+            model_revision: "test".into(),
+            tokenizer_revision: "test".into(),
+            taxonomy_revision: "test".into(),
+            artifact_digest: None,
+            ranking_mode: llm_d_sc::classify::RankingMode::AnchorCosine,
+        }
+    }
+
+    fn classify(&self, input: ClassificationInput) -> Result<ClassificationResult, ClassifyError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if input.text == "blocking" {
+            self.first_started.wait();
+            self.release_first.wait();
+        }
+        Ok(ClassificationResult {
+            classifier_id: "test".into(),
+            model_revision: "test".into(),
+            tokenizer_revision: "test".into(),
+            taxonomy_revision: "test".into(),
+            status: ClassifyStatus::Ok,
+            ranked: vec![RankedSignal {
+                id: "a".into(),
+                score: 1.0,
+            }],
+        })
+    }
+}
+
+#[test]
+fn i092_cancelled_queued_job_is_skipped_and_capacity_recovers() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let first_started = Arc::new(Barrier::new(2));
+    let release_first = Arc::new(Barrier::new(2));
+    let classifier = CancellationClassifier {
+        calls: calls.clone(),
+        first_started: first_started.clone(),
+        release_first: release_first.clone(),
+    };
+    let metrics = Metrics::new();
+    let executor = InferenceExecutor::spawn_with_workers(classifier, metrics.clone(), 2, 1);
+
+    let first = executor
+        .try_enqueue(ClassificationInput {
+            text: "blocking".into(),
+            requested_signals: vec!["sensitivity".into()],
+            session_metadata: Default::default(),
+            context_completeness: Default::default(),
+        })
+        .expect("first job must be admitted");
+    first_started.wait();
+
+    let cancelled = executor
+        .try_enqueue(ClassificationInput {
+            text: "cancelled".into(),
+            requested_signals: vec!["sensitivity".into()],
+            session_metadata: Default::default(),
+            context_completeness: Default::default(),
+        })
+        .expect("second job must be admitted behind the first");
+    drop(cancelled);
+
+    release_first.wait();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    rt.block_on(first)
+        .expect("first job must receive a response")
+        .expect("first forward must succeed");
+
+    // The cancelled job must be discarded, allowing a new job to acquire the
+    // second admission permit. Retry briefly because the worker may still be
+    // between the first forward and the cancelled-job dequeue.
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let third = loop {
+        if let Ok(receiver) = executor.try_enqueue(ClassificationInput {
+            text: "third".into(),
+            requested_signals: vec!["sensitivity".into()],
+            session_metadata: Default::default(),
+            context_completeness: Default::default(),
+        }) {
+            break receiver;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "cancelled job did not release capacity"
+        );
+        std::thread::yield_now();
+    };
+    rt.block_on(third)
+        .expect("third job must receive a response")
+        .expect("third forward must succeed");
+
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "the cancelled queued job must not invoke the classifier"
+    );
+    let snapshot = metrics.snapshot();
+    assert_eq!(snapshot.queued_cancelled, 1);
+    assert_eq!(snapshot.queued_expired, 0);
+}
+
+#[test]
+fn i093_expired_queued_job_is_skipped_and_reports_deadline() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let first_started = Arc::new(Barrier::new(2));
+    let release_first = Arc::new(Barrier::new(2));
+    let classifier = CancellationClassifier {
+        calls: calls.clone(),
+        first_started: first_started.clone(),
+        release_first: release_first.clone(),
+    };
+    let metrics = Metrics::new();
+    let executor = InferenceExecutor::spawn_with_workers(classifier, metrics.clone(), 2, 1);
+
+    let first = executor
+        .try_enqueue(ClassificationInput {
+            text: "blocking".into(),
+            requested_signals: vec!["sensitivity".into()],
+            session_metadata: Default::default(),
+            context_completeness: Default::default(),
+        })
+        .expect("first job must be admitted");
+    first_started.wait();
+
+    let expired = executor
+        .try_enqueue_with_deadline(
+            ClassificationInput {
+                text: "expired".into(),
+                requested_signals: vec!["sensitivity".into()],
+                session_metadata: Default::default(),
+                context_completeness: Default::default(),
+            },
+            Some(Instant::now() - Duration::from_millis(1)),
+        )
+        .expect("expired job must be admitted before the worker checks it");
+
+    release_first.wait();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    rt.block_on(first)
+        .expect("first job must receive a response")
+        .expect("first forward must succeed");
+    let result = rt
+        .block_on(expired)
+        .expect("expired job must receive a result");
+
+    assert!(
+        matches!(result, Err(ClassifyError::RequestExpired)),
+        "expired queued work must return RequestExpired, got {result:?}"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the expired queued job must not invoke the classifier"
+    );
+    let snapshot = metrics.snapshot();
+    assert_eq!(snapshot.queued_expired, 1);
+    assert_eq!(snapshot.queued_cancelled, 0);
 }
