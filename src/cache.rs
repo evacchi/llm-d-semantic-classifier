@@ -23,6 +23,8 @@
 // when the `redis-semantic` feature is enabled. The `SemanticCache` trait,
 // `NoopSemanticCache`, and `identity_tag` below stay always-compiled — they are
 // the seam `ServiceCore` uses, defaulting to the Noop (off) cache.
+pub mod text;
+
 #[cfg(feature = "redis-semantic")]
 pub mod breaker;
 #[cfg(feature = "redis-semantic")]

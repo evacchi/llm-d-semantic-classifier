@@ -296,6 +296,13 @@ pub struct ServiceCore<R> {
     runtime: Arc<R>,
     cache: SharedCache,
     semantic: Arc<dyn SemanticCache>,
+
+    /// L0: the approximate TEXT prefilter, consulted before the forward.
+    ///
+    /// Defaults to a no-op. See `cache::text` for why this tier is off unless
+    /// explicitly enabled: it can serve a result computed for a different prompt,
+    /// so it carries an error rate rather than merely a hit rate.
+    prefilter: Arc<dyn crate::cache::text::TextCache>,
     metrics: Metrics,
 }
 
@@ -319,6 +326,7 @@ where
             runtime: Arc::new(runtime),
             cache: SharedCache::new(),
             semantic: Arc::new(NoopSemanticCache),
+            prefilter: Arc::new(crate::cache::text::NoopTextCache),
             metrics,
         }
     }
@@ -333,6 +341,27 @@ where
             runtime: Arc::new(runtime),
             cache: SharedCache::new(),
             semantic,
+            prefilter: Arc::new(crate::cache::text::NoopTextCache),
+            metrics,
+        }
+    }
+
+    /// Build a service core with an explicit L0 text prefilter.
+    ///
+    /// Separate constructor rather than a field on the existing one: enabling an
+    /// APPROXIMATE tier that can serve another prompt's answer should be an
+    /// explicit act at the call site, not a default someone inherits.
+    pub fn with_text_prefilter(
+        runtime: R,
+        metrics: Metrics,
+        semantic: Arc<dyn SemanticCache>,
+        prefilter: Arc<dyn crate::cache::text::TextCache>,
+    ) -> Self {
+        ServiceCore {
+            runtime: Arc::new(runtime),
+            cache: SharedCache::new(),
+            semantic,
+            prefilter,
             metrics,
         }
     }
@@ -414,6 +443,7 @@ where
         let forward = {
             let runtime = self.runtime.clone();
             let semantic = self.semantic.clone();
+            let prefilter = self.prefilter.clone();
             let tag = tag.clone();
             let input = ClassificationInput {
                 text: normalized,
@@ -422,6 +452,18 @@ where
                 context_completeness: input.context_completeness,
             };
             move || {
+                // L0 (BEFORE the forward). This is the only tier whose hit
+                // avoids the model forward itself -- 30.72 ms p50, and 99.4% of
+                // request latency. L2 sits after `embed`, so its key IS the
+                // forward's output and a hit there saves only `rank`.
+                //
+                // The signature costs microseconds, so an L0 miss is nearly free
+                // and an L0 hit is worth ~30,000x its own cost. That inversion is
+                // the entire reason this tier exists.
+                let sig = crate::prefilter::signature(&input.text);
+                if let Some(hit) = prefilter.lookup(&sig, &tag) {
+                    return Ok(hit);
+                }
                 // Embed once. Reused by both the L2 lookup and the ranker.
                 let embedding = runtime.embed(&input)?;
                 // L2 semantic lookup (fail-open: None on any trouble). L2
@@ -432,6 +474,11 @@ where
                 // L2 miss: rank, then best-effort write-back.
                 let result = runtime.rank(&embedding, &input)?;
                 semantic.insert(&embedding, &result, &tag);
+                // Populate L0 from the SAME result. Writing here rather than on
+                // the L2 path means L0 only ever stores answers this process
+                // actually computed, never one L2 approximated -- approximating
+                // an approximation compounds error with nothing measuring it.
+                prefilter.insert(&sig, &result, &tag);
                 Ok(result)
             }
         };
