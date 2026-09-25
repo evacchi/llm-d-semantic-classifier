@@ -46,6 +46,110 @@ Prove the shape of the service:
 
 Not required: distributed cache, custom kernels, vLLM backend, multiple signals, RL/training, production control plane, hard universal 20 ms SLA.
 
+## 0.2 — release notes
+
+### Classification heads are now the default decision rule
+
+llm-d-sc previously ranked by cosine similarity against taxonomy anchors and
+discarded the trained classifier every ModelCar ships. Measured on 552 real rows,
+anchor ranking scores **below the majority-class baseline** on 3 of 5 signals
+(complexity −2.54, cx2 −3.99, sensitivity −2.73): cosine-to-a-centroid is a
+rank-1 decision rule and cannot express those boundaries.
+
+The trained head now runs whenever a checkpoint ships one, reproducing it to
+**six decimal places**. There is no flag: a deployment that wants anchor ranking
+gets it by serving an embedding-only artifact, which is an honest statement of
+what it has. Scores are softmax probabilities, not similarities.
+
+**Cost, measured through the gateway on 3 replicas: 3.5% of classification
+throughput** and +0.14 to +0.63 ms of p50. Below saturation the two are
+indistinguishable.
+
+`RuntimeMetadata.ranking_mode` reports which rule is live, and it is logged at
+load. The difference between the two never surfaces as an error — only as worse
+routing — so it has to be observable.
+
+### Replicas now add capacity
+
+The Praxis filter held one lazily-connected HTTP/2 channel. `kube-proxy`
+load-balances at CONNECT time, so a multiplexed channel rode that one connection
+forever and additional replicas sat idle: 1→2 replicas previously moved capacity
+462 → 463/sec (**1.00×**), with one pod serving 10,404 classifications and the
+other serving 0.
+
+With `balance_endpoints: true` against a **headless** Service, measured
+**1.96× at 2 replicas** and per-pod shares of 33.1/33.2/33.7 at 3. Coverage at
+1200 offered rps went from ~41% to **101%**. Off by default: it changes the
+connection topology of a deployed proxy, which should be a decision.
+
+### ModernBERT support, including YaRN-scaled checkpoints
+
+llm-d-sc can now serve ModernBERT alongside BERT. Architecture is detected from
+`model_type`; a missing value means BERT (every previously published ModelCar
+omits it) and an **unknown** value is an error rather than a fallback.
+
+`src/modernbert.rs` is **vendored from `candle-transformers` 0.11 with YaRN
+rotary scaling added** — see [ADR-0006](adr/0006-vendored-modernbert.md).
+Upstream ignores `rope_scaling`, and all twelve models in the vSR Vela family use
+YaRN to reach a 32k context, so serving one through upstream produced embeddings
+of the right magnitude and the wrong direction while argmax usually survived. The
+BERT path is NOT vendored and is unchanged.
+
+**Scaling types we do not implement are refused at load** (`longrope`, `dynamic`,
+…). Refusing is the only point at which an unsupported scaling is visible.
+
+### Cache: `exact` remains the default, now for a measured reason
+
+The L2 semantic tier sits between `embed` and `rank`, so its lookup key **is the
+model forward's output**. A hit skips only `rank` — microseconds — while paying a
+Redis KNN round trip on top of a forward that already cost ~31 ms (99.4% of
+request latency). No hit rate or load level makes that profitable; under load the
+round trip gets worse.
+
+An L0 text prefilter (MinHash, consulted *before* the forward, where a hit would
+skip the whole 31 ms) was built and measured against the full model on 6,000 real
+prompts. Its error rate is **flat at 7.6–10.2%** from J≥0.50 to J≥0.80 while the
+hit rate collapses 50% → 4.6%: text similarity and label agreement are close to
+independent, so no threshold separates them. Errors are asymmetric — about 20% of
+TRIVIAL prompts are served a WORK answer at every threshold. **It is off by
+default and should stay off.**
+
+### Classification coverage is now a first-class signal
+
+Classifier saturation is invisible to every signal an operator normally watches:
+above capacity the gateway fails open, throughput tracks offered load, errors stay
+at zero, and p50 *improves* as requests bypass classification. Measured on 3
+replicas, coverage falls ~101% → 43% between 1600 and 3200 offered rps with zero
+errors and p50 dropping 562 ms → 2 ms.
+
+`llm_d_sc_classify_total` now carries a `classified` dimension so coverage is an
+unambiguous ratio. The judgement is made in code because it is subtle:
+`LOW_CONFIDENCE`, `UNMAPPED_LABEL` and `ABSTAIN` are *successful* classifications
+the router declined to act on.
+
+```promql
+sum(rate(llm_d_sc_classify_total{classified="true"}[5m]))
+  / sum(rate(llm_d_sc_classify_total[5m]))
+```
+
+**Alert on this, not on latency or errors.**
+
+### Fixes
+
+- ModelCar required files key on `modules.json`, not architecture. A plain
+  HuggingFace `ForSequenceClassification` checkpoint has no `1_Pooling/` and must
+  still serve; the readiness gate was stricter than the loader it gates.
+- The L2 isolation tag carries the artifact digest, so a rebuilt artifact under an
+  unchanged revision can no longer miss in L1 and hit in L2.
+- `src/bin/playground.rs` sets `context_completeness`; the branch did not compile.
+
+### Known gaps
+
+- `identity_tag` aliases when a field contains a pipe. L1 is immune (length-prefixed).
+- Vela **quality** numbers are being re-measured now that YaRN is honoured; its
+  **capacity** figure stands: 53.9 cls/sec against 449.6 for a 6-layer BERT
+  ModelCar, i.e. 8.3× slower.
+
 ## 0.20 Runtime hardening
 
 Make the service trustworthy before making it clever:

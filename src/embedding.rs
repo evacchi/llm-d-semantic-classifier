@@ -17,7 +17,11 @@ use std::path::Path;
 
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
-use candle_transformers::models::{bert, modernbert};
+use candle_transformers::models::bert;
+// ModernBERT comes from the VENDORED copy, which honours `rope_scaling`.
+// Upstream's ignores it, which silently rotates the embeddings of any
+// YaRN-scaled checkpoint -- the entire Vela family. BERT stays upstream.
+use crate::modernbert;
 use serde_json::Value;
 
 use crate::tokenizer::Tokenizer;
@@ -47,11 +51,10 @@ impl std::fmt::Display for EmbeddingError {
             EmbeddingError::UnsupportedRopeScaling(kind) => write!(
                 f,
                 "checkpoint declares rope_scaling type '{kind}', which this build \
-                 cannot honour: the resident candle ignores rope_scaling, so the \
-                 encoder would emit rotated embeddings while argmax still looked \
-                 plausible. Refusing to load rather than serving wrong scores. \
-                 Use a checkpoint without rope_scaling, or a build whose candle \
-                 supports it."
+                 does not implement. Only 'yarn' is supported (see \
+                 src/modernbert.rs). Loading an unimplemented scaling would emit \
+                 rotated embeddings while argmax still looked plausible, so this \
+                 refuses rather than serving wrong scores."
             ),
             EmbeddingError::Candle(e) => write!(f, "embedding candle error: {e}"),
             EmbeddingError::Tokenizer(e) => write!(f, "embedding tokenizer error: {e}"),
@@ -201,8 +204,15 @@ impl Backbone {
                 // Refusing at load is the only point where this is visible. Once
                 // the service is answering, nothing downstream can tell the
                 // difference without a parity check against the original.
+                // YaRN is honoured by the vendored ModernBERT. Anything else is
+                // still refused: loading a scaling we do not implement produces
+                // rotated embeddings that preserve magnitude and usually preserve
+                // argmax, so it is invisible without a parity check against the
+                // original. Refusing at load is the only point where it shows.
                 if let Some(kind) = rope_scaling_kind(raw) {
-                    return Err(EmbeddingError::UnsupportedRopeScaling(kind));
+                    if !kind.eq_ignore_ascii_case("yarn") {
+                        return Err(EmbeddingError::UnsupportedRopeScaling(kind));
+                    }
                 }
                 Ok(BackboneConfig::ModernBert(Box::new(
                     serde_json::from_str(raw).map_err(EmbeddingError::Json)?,
@@ -562,6 +572,28 @@ mod tests {
         );
     }
 
+    /// YaRN is now HONOURED by the vendored ModernBERT, so a Vela checkpoint
+    /// must load. Before vendoring this was refused; the refusal was correct
+    /// then and would be wrong now.
+    #[test]
+    fn u077b_yarn_checkpoints_now_load() {
+        let vela = r#"{
+          "model_type": "modernbert",
+          "rope_scaling": {"rope_type": "yarn", "factor": 4.0,
+                           "original_max_position_embeddings": 8192},
+          "vocab_size": 256000, "hidden_size": 768, "num_hidden_layers": 22,
+          "num_attention_heads": 12, "intermediate_size": 1152,
+          "max_position_embeddings": 32768, "layer_norm_eps": 1e-5,
+          "pad_token_id": 1, "global_attn_every_n_layers": 3,
+          "global_rope_theta": 160000.0, "local_attention": 128,
+          "local_rope_theta": 160000.0
+        }"#;
+        match Backbone::parse_config(vela) {
+            Ok(c) => assert_eq!(c.kind(), BackboneKind::ModernBert),
+            Err(e) => panic!("a YaRN checkpoint must load now that it is honoured: {e}"),
+        }
+    }
+
     /// A checkpoint we cannot serve faithfully must be REFUSED, not loaded.
     ///
     /// All twelve models in the Vela family declare `rope_scaling.rope_type:
@@ -574,11 +606,15 @@ mod tests {
     /// Load time is the only place this is visible. Once the service is
     /// answering, nothing downstream can tell without a parity check.
     #[test]
-    fn u077_rope_scaling_checkpoints_are_refused() {
-        let vela = r#"{
+    fn u077_unimplemented_rope_scaling_is_refused() {
+        // longrope is a real HuggingFace scaling type this build does not
+        // implement. Loading one would emit rotated embeddings that preserve
+        // magnitude and usually preserve argmax, so it is invisible without a
+        // parity check. Load time is the only place it shows.
+        let unimplemented = r#"{
           "model_type": "modernbert",
-          "rope_scaling": {"rope_type": "yarn", "factor": 4.0,
-                           "original_max_position_embeddings": 8192},
+          "rope_scaling": {"rope_type": "longrope", "factor": 8.0,
+                           "original_max_position_embeddings": 4096},
           "vocab_size": 256000, "hidden_size": 768, "num_hidden_layers": 22,
           "num_attention_heads": 12, "intermediate_size": 1152,
           "max_position_embeddings": 32768, "layer_norm_eps": 1e-5,
@@ -586,17 +622,17 @@ mod tests {
           "global_rope_theta": 160000.0, "local_attention": 128,
           "local_rope_theta": 160000.0
         }"#;
-        let msg = match Backbone::parse_config(vela) {
+        let msg = match Backbone::parse_config(unimplemented) {
             Err(e) => format!("{e}"),
-            Ok(_) => panic!("a YaRN checkpoint must be refused, not loaded"),
+            Ok(_) => panic!("an unimplemented scaling must be refused, not loaded"),
         };
         assert!(
-            msg.contains("yarn"),
+            msg.contains("longrope"),
             "the error must name the scaling type: {msg}"
         );
         assert!(
-            msg.contains("Refusing to load"),
-            "the error must say what it did and why: {msg}"
+            msg.contains("yarn"),
+            "the error should say which scaling IS supported: {msg}"
         );
     }
 

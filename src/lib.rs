@@ -16,6 +16,7 @@ pub mod grpc;
 pub mod handoff;
 pub mod head;
 pub mod metrics;
+pub mod modernbert;
 pub mod prefilter;
 pub mod queue;
 pub mod ranker;
