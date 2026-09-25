@@ -221,6 +221,12 @@ impl Backbone {
 pub struct Embedder {
     model: Backbone,
     tokenizer: Tokenizer,
+
+    /// The ModelCar's sequence-classification head, when it ships one.
+    head: Option<crate::head::SequenceHead>,
+
+    /// Label names in class-index order, present exactly when `head` is.
+    labels: Option<crate::head::LabelMap>,
 }
 
 impl Embedder {
@@ -244,7 +250,17 @@ impl Embedder {
             VarBuilder::from_mmaped_safetensors(&[weights.as_ref()], DType::F32, &device)
         }
         .map_err(EmbeddingError::Candle)?;
-        let model = Backbone::load(vb, &config)?;
+        let model = Backbone::load(vb.clone(), &config)?;
+
+        // A head is loaded only when the ModelCar DECLARES one via id2label and
+        // its weights are actually present. An embedding-only artifact is
+        // legitimate and keeps working on the anchor path.
+        let labels = crate::head::LabelMap::from_config(&raw);
+        let head = match labels.as_ref() {
+            Some(l) => crate::head::SequenceHead::load(&vb, &config, l)?,
+            None => None,
+        };
+        let labels = head.as_ref().and(labels);
 
         let tokenizer = Tokenizer::load(tokenizer_path).map_err(EmbeddingError::Tokenizer)?;
         // The pooling config pins the expected embedding dimension; validate it
@@ -266,7 +282,12 @@ impl Embedder {
             }
         }
 
-        Ok(Embedder { model, tokenizer })
+        Ok(Embedder {
+            model,
+            tokenizer,
+            head,
+            labels,
+        })
     }
 
     /// Tokenize `text` into its token-ID sequence. Split out so a caller can
@@ -290,16 +311,38 @@ impl Embedder {
             Tensor::ones((1, seq_len), DType::U32, device).map_err(EmbeddingError::Candle)?;
 
         let sequence = self.model.forward(&input_ids, &attention_mask)?;
+        pool_and_normalize(&sequence, &attention_mask)
+    }
 
-        let pooled = mean_pool(&sequence, &attention_mask).map_err(EmbeddingError::Candle)?;
-        let flat = pooled.squeeze(0).map_err(EmbeddingError::Candle)?;
-        // The classifier definition (`modules.json`) declares a Normalize module,
-        // so the returned embedding is L2-normalized to unit norm.
-        let norm = flat.norm().map_err(EmbeddingError::Candle)?;
-        let normalized = flat
-            .broadcast_div(&norm.unsqueeze(0).map_err(EmbeddingError::Candle)?)
-            .map_err(EmbeddingError::Candle)?;
-        normalized.to_vec1::<f32>().map_err(EmbeddingError::Candle)
+    /// The head's label set, when this ModelCar ships a usable head.
+    pub fn labels(&self) -> Option<&[String]> {
+        self.labels.as_ref().map(crate::head::LabelMap::labels)
+    }
+
+    /// Embed AND classify in one forward.
+    ///
+    /// One forward, two outputs. Running the encoder again to get logits would
+    /// double the cost of the single most expensive stage in the service -- the
+    /// model forward is 99.4% of request latency (S-080).
+    pub fn embed_and_classify(
+        &self,
+        ids: Vec<u32>,
+    ) -> Result<(Vec<f32>, Option<Vec<f32>>), EmbeddingError> {
+        let seq_len = ids.len();
+        let device = self.model.device();
+        let input_ids =
+            Tensor::from_vec(ids, (1, seq_len), device).map_err(EmbeddingError::Candle)?;
+        let attention_mask =
+            Tensor::ones((1, seq_len), DType::U32, device).map_err(EmbeddingError::Candle)?;
+
+        let sequence = self.model.forward(&input_ids, &attention_mask)?;
+        let embedding = pool_and_normalize(&sequence, &attention_mask)?;
+
+        let logits = match self.head.as_ref() {
+            Some(h) => Some(h.logits(&self.model, &input_ids, &attention_mask, &sequence)?),
+            None => None,
+        };
+        Ok((embedding, logits))
     }
 
     /// Embed `text`: tokenize, run the model forward, and mean-pool the
@@ -309,6 +352,24 @@ impl Embedder {
         let ids = self.tokenize(text)?;
         self.embed_ids(ids)
     }
+}
+
+/// Masked mean-pool then L2-normalize, as `modules.json` declares.
+///
+/// Shared by `embed_ids` and `embed_and_classify` so the two cannot drift: an
+/// embedding that differed between the head path and the anchor path would make
+/// every A/B between them measure the pooling, not the head.
+fn pool_and_normalize(
+    sequence: &Tensor,
+    attention_mask: &Tensor,
+) -> Result<Vec<f32>, EmbeddingError> {
+    let pooled = mean_pool(sequence, attention_mask).map_err(EmbeddingError::Candle)?;
+    let flat = pooled.squeeze(0).map_err(EmbeddingError::Candle)?;
+    let norm = flat.norm().map_err(EmbeddingError::Candle)?;
+    let normalized = flat
+        .broadcast_div(&norm.unsqueeze(0).map_err(EmbeddingError::Candle)?)
+        .map_err(EmbeddingError::Candle)?;
+    normalized.to_vec1::<f32>().map_err(EmbeddingError::Candle)
 }
 
 /// Masked mean-pool over the sequence dimension (dim 1), matching the

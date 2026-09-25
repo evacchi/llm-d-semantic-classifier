@@ -87,12 +87,31 @@ pub enum ContextCompleteness {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Embedding {
     pub vector: Vec<f32>,
+
+    /// Raw classifier logits, when the ModelCar ships a usable head.
+    ///
+    /// Carried HERE, on the embedding, because they come out of the same model
+    /// forward the vector does. The embed/rank split exists so that forward runs
+    /// at most once per classification; recomputing logits in `rank` would run it
+    /// twice and make every cache hit pay for a head it already had.
+    ///
+    /// `None` means the artifact is embedding-only and ranking falls back to
+    /// anchor cosine.
+    pub logits: Option<Vec<f32>>,
 }
 
 impl Embedding {
-    /// Wrap a raw embedding vector.
+    /// Wrap a raw embedding vector with no head output.
     pub fn new(vector: Vec<f32>) -> Self {
-        Embedding { vector }
+        Embedding {
+            vector,
+            logits: None,
+        }
+    }
+
+    /// Wrap an embedding together with the head's logits.
+    pub fn with_logits(vector: Vec<f32>, logits: Option<Vec<f32>>) -> Self {
+        Embedding { vector, logits }
     }
 
     /// The embedding dimension.
@@ -654,13 +673,13 @@ impl ClassifierRuntime for CandleClassifier {
         // Forward stage (AC-012): the real model forward.
         let forward_start = std::time::Instant::now();
         self.forward_calls.fetch_add(1, Ordering::SeqCst);
-        let vector = self
+        let (vector, logits) = self
             .embedder
-            .embed_ids(ids)
+            .embed_and_classify(ids)
             .map_err(|e| ClassifyError::Embedding(e.to_string()))?;
         self.metrics
             .record_stage(LatencyStage::Forward, forward_start.elapsed());
-        Ok(Embedding::new(vector))
+        Ok(Embedding::with_logits(vector, logits))
     }
 
     /// Rank a previously-computed embedding against the resident taxonomy (or
@@ -672,6 +691,22 @@ impl ClassifierRuntime for CandleClassifier {
         _input: &ClassificationInput,
     ) -> Result<ClassificationResult, ClassifyError> {
         let v = &embedding.vector;
+
+        // HEAD FIRST when the artifact ships one. Anchor cosine ranks BELOW the
+        // majority-class baseline on 3 of 5 measured signals (complexity -2.54,
+        // cx2 -3.99, sensitivity -2.73) because cosine-to-a-centroid is a rank-1
+        // rule; the trained head on the same vectors is worth +16.31 on
+        // complexity. The anchor path remains for embedding-only ModelCars, which
+        // are legitimate artifacts, not a legacy mode.
+        if let (Some(logits), Some(labels)) = (embedding.logits.as_ref(), self.embedder.labels()) {
+            if logits.len() == labels.len() {
+                return self.rank_from_head(logits, labels);
+            }
+            // A head whose width disagrees with its label map cannot be
+            // interpreted at all: column i would name the wrong class. Fall
+            // through to anchors rather than emit confident mislabels.
+        }
+
         let (ranked, identity) = match self.taxonomy.as_ref() {
             Some(t) => (
                 anchor_rank(v, &t.anchors, t.top_k),
@@ -704,6 +739,68 @@ impl ClassifierRuntime for CandleClassifier {
             model_revision: identity.1,
             tokenizer_revision,
             taxonomy_revision: identity.2,
+            status: ClassifyStatus::Ok,
+            ranked,
+        })
+    }
+}
+
+impl CandleClassifier {
+    /// Rank from the trained classification head.
+    ///
+    /// Scores are SOFTMAX PROBABILITIES, not raw logits and not cosine
+    /// similarities. That distinction is load-bearing: this service previously
+    /// emitted negative-capable cosine similarities as if they were scores, and
+    /// because argmax survives any monotone transform the accuracy looked right
+    /// while every calibration, risk-coverage and abstention threshold computed
+    /// downstream ran on nonsense. A score leaving here is a probability.
+    fn rank_from_head(
+        &self,
+        logits: &[f32],
+        labels: &[String],
+    ) -> Result<ClassificationResult, ClassifyError> {
+        let probs = crate::head::softmax(logits);
+        let mut ranked: Vec<RankedSignal> = labels
+            .iter()
+            .zip(probs.iter())
+            .map(|(id, p)| RankedSignal {
+                id: id.clone(),
+                score: f64::from(*p),
+            })
+            .collect();
+        // Descending by score; ties broken by label so the order is stable
+        // across runs and a golden comparison does not flap.
+        ranked.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        if let Some(t) = self.taxonomy.as_ref() {
+            if t.top_k > 0 && ranked.len() > t.top_k {
+                ranked.truncate(t.top_k);
+            }
+        }
+        let (classifier_id, model_revision, taxonomy_revision, tokenizer_revision) =
+            match self.taxonomy.as_ref() {
+                Some(t) => (
+                    t.classifier_id.clone(),
+                    t.model_revision.clone(),
+                    t.taxonomy_revision.clone(),
+                    t.tokenizer_revision.clone(),
+                ),
+                None => (
+                    CLASSIFIER_ID.to_string(),
+                    MODEL_REVISION.to_string(),
+                    TAXONOMY_REVISION.to_string(),
+                    TOKENIZER_REVISION.to_string(),
+                ),
+            };
+        Ok(ClassificationResult {
+            classifier_id,
+            model_revision,
+            tokenizer_revision,
+            taxonomy_revision,
             status: ClassifyStatus::Ok,
             ranked,
         })
