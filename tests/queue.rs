@@ -49,6 +49,7 @@ impl ClassifierRuntime for SlowClassifier {
             tokenizer_revision: "test".into(),
             taxonomy_revision: "test".into(),
             artifact_digest: None,
+            ranking_mode: llm_d_sc::classify::RankingMode::AnchorCosine,
         }
     }
 

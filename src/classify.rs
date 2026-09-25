@@ -228,6 +228,29 @@ pub trait ClassifierRuntime {
     fn metadata(&self) -> RuntimeMetadata;
 }
 
+/// How a runtime turns an embedding into ranked signals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RankingMode {
+    /// The checkpoint's own trained classifier. Scores are softmax probabilities.
+    TrainedHead,
+    /// Cosine against taxonomy anchors. Used when the ModelCar ships no head.
+    ///
+    /// Measured BELOW the majority-class baseline on 3 of 5 signals (complexity
+    /// -2.54, cx2 -3.99, sensitivity -2.73): cosine-to-a-centroid is a rank-1
+    /// decision rule and cannot express those boundaries.
+    AnchorCosine,
+}
+
+impl RankingMode {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RankingMode::TrainedHead => "trained_head",
+            RankingMode::AnchorCosine => "anchor_cosine",
+        }
+    }
+}
+
 /// The immutable identity of a loaded classifier.
 ///
 /// `artifact_digest` is content-derived (see [`crate::runtime::modelcar_digest`])
@@ -244,6 +267,15 @@ pub struct RuntimeMetadata {
     pub taxonomy_revision: String,
     /// Content digest of the resident artifact, when it was loaded from one.
     pub artifact_digest: Option<String>,
+
+    /// Which decision rule this runtime is actually using.
+    ///
+    /// Carried in metadata rather than left implicit because the two rules are
+    /// not close in quality: the trained head reproduces the checkpoint exactly,
+    /// while anchor cosine scores below a constant classifier on most signals.
+    /// Without this, an operator cannot tell from outside which one is live --
+    /// and the difference does not show up as an error, only as worse routing.
+    pub ranking_mode: RankingMode,
 }
 
 impl RuntimeMetadata {
@@ -687,6 +719,7 @@ impl ClassifierRuntime for CandleClassifier {
                 tokenizer_revision: t.tokenizer_revision.clone(),
                 taxonomy_revision: t.taxonomy_revision.clone(),
                 artifact_digest: t.artifact_digest.clone(),
+                ranking_mode: self.ranking_mode(),
             },
             // The weight-free synthetic path, used only by tests.
             None => RuntimeMetadata {
@@ -695,6 +728,8 @@ impl ClassifierRuntime for CandleClassifier {
                 model_revision: MODEL_REVISION.to_string(),
                 tokenizer_revision: TOKENIZER_REVISION.to_string(),
                 taxonomy_revision: TAXONOMY_REVISION.to_string(),
+                // The synthetic path has no checkpoint, so no head.
+                ranking_mode: RankingMode::AnchorCosine,
                 artifact_digest: None,
             },
         }
@@ -793,6 +828,20 @@ impl ClassifierRuntime for CandleClassifier {
 }
 
 impl CandleClassifier {
+    /// Which decision rule this classifier will actually use.
+    ///
+    /// Derived from what the ModelCar loaded, not from configuration: the head
+    /// is used whenever the checkpoint ships a usable one, and there is no flag
+    /// to turn it off. A deployment that wants anchor ranking gets it by serving
+    /// an embedding-only artifact, which is an honest statement of what it has.
+    #[must_use]
+    pub fn ranking_mode(&self) -> RankingMode {
+        match self.embedder.labels() {
+            Some(_) => RankingMode::TrainedHead,
+            None => RankingMode::AnchorCosine,
+        }
+    }
+
     /// Rank from the trained classification head.
     ///
     /// Scores are SOFTMAX PROBABILITIES, not raw logits and not cosine
@@ -964,6 +1013,8 @@ impl ClassifyService {
 impl ClassifierRuntime for ClassifyService {
     fn metadata(&self) -> RuntimeMetadata {
         RuntimeMetadata {
+            // Synthetic prototypes, never a trained head.
+            ranking_mode: RankingMode::AnchorCosine,
             classifier_id: CLASSIFIER_ID.to_string(),
             signal: "sensitivity".to_string(),
             model_revision: MODEL_REVISION.to_string(),

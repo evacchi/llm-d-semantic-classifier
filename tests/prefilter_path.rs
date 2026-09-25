@@ -31,6 +31,7 @@ impl ClassifierRuntime for CountingRuntime {
             tokenizer_revision: "tok-1".into(),
             taxonomy_revision: "tax-1".into(),
             artifact_digest: None,
+            ranking_mode: llm_d_sc::classify::RankingMode::AnchorCosine,
         }
     }
 

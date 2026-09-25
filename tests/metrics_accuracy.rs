@@ -89,6 +89,7 @@ impl ClassifierRuntime for SlowRuntime {
             tokenizer_revision: "rev".into(),
             taxonomy_revision: "rev".into(),
             artifact_digest: None,
+            ranking_mode: llm_d_sc::classify::RankingMode::AnchorCosine,
         }
     }
 }

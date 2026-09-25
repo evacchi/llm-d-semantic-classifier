@@ -98,6 +98,7 @@ fn u112_every_identity_component_participates_in_the_cache_key() {
         tokenizer_revision: "tokenizer-rev".into(),
         taxonomy_revision: "taxonomy-rev".into(),
         artifact_digest: Some("blake3:artifact".into()),
+        ranking_mode: llm_d_sc::classify::RankingMode::AnchorCosine,
     };
     let key = |m: &RuntimeMetadata| {
         let (c, mo, tk, tx, digest) = m.cache_identity();
