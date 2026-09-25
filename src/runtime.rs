@@ -19,28 +19,29 @@ pub const MODELCAR_REQUIRED_FILES: &[&str] = &[
     "1_Pooling/config.json",
 ];
 
-/// The required-file set for the ModelCar at `dir`, chosen by the architecture
-/// its `config.json` declares.
+/// The required-file set for the ModelCar at `dir`.
 ///
-/// `1_Pooling/config.json` is a sentence-transformers artifact. BERT ModelCars
-/// built by this project ship it and it pins the embedding dimension, so it
-/// stays required for them. ModernBERT ModelCars published upstream -- the Vela
-/// family is the case in hand -- do not ship a sentence-transformers module
-/// stack at all, so demanding that file makes a well-formed artifact
-/// permanently unready for a file it was never meant to contain.
+/// `1_Pooling/config.json` is a **sentence-transformers** artifact, and what
+/// declares that module stack is `modules.json`. So the requirement keys on
+/// `modules.json`, not on the architecture.
 ///
-/// An unreadable or unparseable `config.json` returns the BERT set: that is the
-/// stricter requirement, and a ModelCar whose config cannot be read must fail
-/// readiness on its own merits rather than be granted a relaxed file list.
+/// An earlier version keyed on architecture -- BERT required the pooling config,
+/// ModernBERT did not -- which was wrong in the direction that matters. A BERT
+/// `ForSequenceClassification` checkpoint published straight from HuggingFace has
+/// no `1_Pooling` either, and that is exactly the artifact shape we most want to
+/// serve now that trained heads are used. `cnuland/llm-d-sc-complexity-v3` failed
+/// readiness on a file it was never meant to contain, while `Embedder::load`
+/// would have loaded it happily: the gate was stricter than the loader it gates.
+///
+/// A ModelCar that DOES declare the module stack still must ship the pooling
+/// config -- a declared-then-missing module is a broken artifact, not an optional
+/// one.
 pub fn modelcar_required_files<P: AsRef<Path>>(dir: P) -> &'static [&'static str] {
-    const MODERNBERT: &[&str] = &["model.safetensors", "config.json", "tokenizer.json"];
-    let cfg = dir.as_ref().join("config.json");
-    match std::fs::read_to_string(cfg) {
-        Ok(raw) => match crate::embedding::Backbone::parse_config(&raw) {
-            Ok(c) if c.kind() == crate::embedding::BackboneKind::ModernBert => MODERNBERT,
-            _ => MODELCAR_REQUIRED_FILES,
-        },
-        Err(_) => MODELCAR_REQUIRED_FILES,
+    const CORE: &[&str] = &["model.safetensors", "config.json", "tokenizer.json"];
+    if dir.as_ref().join("modules.json").exists() {
+        MODELCAR_REQUIRED_FILES
+    } else {
+        CORE
     }
 }
 
@@ -223,12 +224,13 @@ impl Default for Runtime {
 mod tests {
     use super::{Runtime, MODELCAR_REQUIRED_FILES};
 
-    /// Vela ModelCars (llm-semantic-router/Vela-1.0-Encoder-307M*) are
-    /// ModernBERT and ship no sentence-transformers module stack, so they have
-    /// no 1_Pooling/config.json. Requiring it made a well-formed artifact
-    /// permanently unready for a file it was never meant to contain.
+    /// A ModelCar with no sentence-transformers module stack (no modules.json)
+    /// must not be asked for 1_Pooling/config.json. Both Vela (ModernBERT) and a
+    /// plain HF BertForSequenceClassification checkpoint are this shape, and
+    /// requiring it made well-formed artifacts permanently unready for a file
+    /// they were never meant to contain.
     #[test]
-    fn u074_modernbert_modelcar_does_not_require_pooling_config() {
+    fn u074_modelcar_without_modules_json_does_not_require_pooling_config() {
         let dir = std::env::temp_dir().join("llm-d-sc-u074");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
@@ -250,11 +252,11 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// The BERT path must be unchanged -- every classifier already deployed by
-    /// this project ships 1_Pooling/config.json and relies on it to pin the
-    /// embedding dimension.
+    /// A ModelCar that DECLARES the module stack must still ship the pooling
+    /// config: declared-then-missing is a broken artifact. Every classifier this
+    /// project has deployed is this shape.
     #[test]
-    fn u075_bert_modelcar_still_requires_pooling_config() {
+    fn u075_modelcar_with_modules_json_still_requires_pooling_config() {
         let dir = std::env::temp_dir().join("llm-d-sc-u075");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
@@ -267,20 +269,28 @@ mod tests {
                 "pad_token_id":0,"classifier_dropout":null}"#,
         )
         .unwrap();
+        std::fs::write(dir.join("modules.json"), r#"[{"idx":0,"path":""}]"#).unwrap();
         assert!(super::modelcar_required_files(&dir).contains(&"1_Pooling/config.json"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// An unreadable config must get the STRICTER set, never the relaxed one:
-    /// a ModelCar we cannot identify must not be granted a shorter file list.
+    /// A plain HF classifier checkpoint -- config.json + weights + tokenizer, no
+    /// modules.json -- must be servable. This is the artifact shape that failed
+    /// on the cluster (cnuland/llm-d-sc-complexity-v3) and motivated the rule.
     #[test]
-    fn u076_unreadable_config_falls_back_to_the_strict_set() {
-        let dir = std::env::temp_dir().join("llm-d-sc-u076-missing");
-        let _ = std::fs::remove_dir_all(&dir);
-        assert_eq!(
-            super::modelcar_required_files(&dir),
-            MODELCAR_REQUIRED_FILES
+    fn u076_plain_hf_classifier_checkpoint_is_servable() {
+        let dir = std::env::temp_dir().join("llm-d-sc-u076");
+        std::fs::create_dir_all(&dir).unwrap();
+        for f in ["config.json", "model.safetensors", "tokenizer.json"] {
+            std::fs::write(dir.join(f), "{}").unwrap();
+        }
+        let req = super::modelcar_required_files(&dir);
+        assert!(!req.contains(&"1_Pooling/config.json"));
+        assert!(
+            req.iter().all(|f| dir.join(f).exists()),
+            "every required file must be present for a plain HF checkpoint"
         );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
