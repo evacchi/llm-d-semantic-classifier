@@ -1,0 +1,5 @@
+[files]
+extend-exclude = [
+    # Model tokenizer vocabularies contain arbitrary text fragments.
+    "**/tokenizer.json",
+]
