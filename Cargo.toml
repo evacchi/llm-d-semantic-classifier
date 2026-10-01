@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.92"
 description = "llm-d-sc semantic classification runtime"
+license = "Apache-2.0"
 
 [lib]
 name = "llm_d_sc"
