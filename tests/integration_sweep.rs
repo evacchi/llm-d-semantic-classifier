@@ -280,7 +280,6 @@ fn i031_simultaneous_same_key_misses_have_bounded_forward_count() {
         .collect();
     let ok = handles
         .into_iter()
-        .filter(|h| !h.is_finished() || true)
         .map(|h| h.join().expect("caller thread must not panic"))
         .filter(|b| *b)
         .count();
