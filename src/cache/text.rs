@@ -124,8 +124,7 @@ impl TextCache for MemoryTextCache {
                     continue; // a different model/taxonomy: never serve across it
                 }
                 let j = sig.jaccard(&e.sig);
-                // `is_none_or` is stable since 1.82; this crate pins MSRV 1.75.
-                if best.as_ref().map_or(true, |(bj, _)| j > *bj) {
+                if best.as_ref().is_none_or(|(bj, _)| j > *bj) {
                     best = Some((j, e));
                 }
             }

@@ -14,7 +14,7 @@ jobs:
       - name: toolchain (when crate exists)
         run: |
           if [ -f Cargo.toml ]; then
-            rustup toolchain install stable --profile minimal --component rustfmt,clippy
+            rustup toolchain install 1.96.0 --profile minimal --component rustfmt,clippy
             sudo apt-get update -q && sudo apt-get install -y -q protobuf-compiler
           fi
       - run: ./hack/verify

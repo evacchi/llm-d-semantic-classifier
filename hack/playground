@@ -8,9 +8,9 @@
 #   LLM_D_SC_PLAYGROUND_ADDR=127.0.0.1:9000 ./hack/playground
 #   LLM_D_SC_CLASSIFIER=sensitivity ./hack/playground
 #
-# Requirements it checks for you: a Rust toolchain >= 1.80 (the redis-semantic
-# feature), Docker (for Redis Stack), and Python 3 + huggingface_hub (one-time
-# ~90MB model download; installed via pip if missing).
+# Requirements it checks for you: Rust 1.92 or newer, Docker (for Redis Stack),
+# and Python 3 + huggingface_hub (one-time ~90MB model download, installed via
+# pip if missing).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -37,7 +37,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 # --- Rust toolchain ---------------------------------------------------------
-command -v cargo >/dev/null 2>&1 || die "cargo not found. Install Rust >= 1.80 (https://rustup.rs)."
+command -v cargo >/dev/null 2>&1 || die "cargo not found. Install Rust >= 1.92 (https://rustup.rs)."
 
 # --- Redis Stack (semantic L2 tier) -----------------------------------------
 CACHE_STRATEGY="redis-semantic"

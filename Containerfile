@@ -12,8 +12,7 @@
 # The image is built WITH `redis-semantic` so the L2 semantic cache can be
 # switched on at runtime via `LLM_D_SC_CACHE=redis-semantic` (default `exact`,
 # i.e. off) without needing a different image. The crate's DEFAULT build stays
-# dependency-light to hold MSRV 1.75; this builder is a separate toolchain
-# (rust:1-bookworm >= 1.80), so that intent is unaffected.
+# dependency-light; this builder must satisfy the crate's Rust 1.92 MSRV.
 FROM rust:1-bookworm AS builder
 RUN apt-get update \
  && apt-get install -y --no-install-recommends protobuf-compiler build-essential \

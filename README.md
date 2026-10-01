@@ -151,9 +151,9 @@ taxonomies and should not be read as confidence in a statistical sense.
 the default build. The built-in exact-match cache only reuses a label for the
 identical text. The Redis-backed semantic tier is gated behind the
 `redis-semantic` cargo feature, so the default build stays dependency-light and
-keeps MSRV 1.75; enabling the feature pulls in the `redis` crate, which requires
-rustc ≥ 1.80. Build it in with `--features redis-semantic`, then set
-`LLM_D_SC_CACHE=redis-semantic` to add an optional L2 tier behind the exact
+has a declared MSRV of 1.92. To enable it, build with
+`--features redis-semantic`, then set `LLM_D_SC_CACHE=redis-semantic` to add an
+optional L2 tier behind the exact
 cache: on an exact-cache miss, after the prompt is embedded, a semantically
 similar prior prompt reuses its stored label instead of re-ranking. (A binary
 built without the feature logs a warning and falls back to the exact cache if
