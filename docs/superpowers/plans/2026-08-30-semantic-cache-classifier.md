@@ -6,13 +6,13 @@
 
 **Architecture:** Split the `ClassifierRuntime` forward into `embed` + `rank` (embed once), introduce a `SemanticCache` strategy trait (`NoopSemanticCache` default, `RedisSemanticCache` opt-in), and have `ServiceCore` orchestrate `L1 exact → embed → L2 semantic KNN → rank → write-back`. Redis is best-effort and fail-open: any Redis error degrades to compute and never fails a request.
 
-**Tech Stack:** Rust (edition 2021, rustc ≥ 1.75), Candle BERT embeddings (already present), `redis` crate (sync API + `r2d2` pool) against Redis Stack / Redis 8+ (RediSearch vector index), blake3 (existing L1 key).
+**Tech Stack:** Rust (edition 2021, rustc ≥ 1.92; raised from the original 1.75 target to match the current dependency graph), Candle BERT embeddings (already present), `redis` crate (sync API + `r2d2` pool) against Redis Stack / Redis 8+ (RediSearch vector index), blake3 (existing L1 key).
 
 **Spec:** `docs/superpowers/specs/2026-08-30-semantic-cache-classifier-design.md`
 
 ## Global Constraints
 
-- Edition 2021, `rust-version = 1.75`; do not raise the MSRV.
+- Edition 2021, `rust-version = 1.92` (updated from the original 1.75 target after dependency metadata showed the current graph requires Rust 1.88 or newer).
 - No network access on the default path. The semantic tier is **off by default** (`LLM_D_SC_CACHE=exact`); when off, behavior must be byte-for-byte identical to today.
 - **Fail-open, always:** every Redis error/timeout returns "no hit" (lookup) or is dropped (insert); classification never returns an error because of Redis.
 - Preserve the existing L1 exact cache, single-flight coalescing, FIFO eviction, and the blake3 versioned `CacheKey` unchanged.
