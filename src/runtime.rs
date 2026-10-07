@@ -84,15 +84,26 @@ pub fn modelcar_digest<P: AsRef<Path>>(
 
 /// Readiness gate for the resident runtime.
 ///
-/// Starts NOT ready and only flips to READY after a successful warmup.
+/// Starts NOT ready and only flips to READY after a successful warmup. A
+/// server that has begun graceful shutdown reports DRAINING: admission is
+/// stopped and in-flight work is finishing, so it is no longer ready for NEW
+/// traffic even though resident work is still completing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Readiness {
     NotReady,
     Ready,
+    /// Graceful shutdown has begun: no new work is admitted and in-flight
+    /// work is draining. Observed by [`ClassifyServer::readiness`] after
+    /// [`ClassifyServer::shutdown`] (U-035/I-013 readiness flip).
+    ///
+    /// [`ClassifyServer::readiness`]: crate::grpc::classify::ClassifyServer::readiness
+    /// [`ClassifyServer::shutdown`]: crate::grpc::classify::ClassifyServer::shutdown
+    Draining,
 }
 
 impl Readiness {
-    /// True only when the runtime is ready to serve traffic.
+    /// True only when the runtime is ready to serve traffic
+    /// and it is not shutting down.
     pub fn ready(self) -> bool {
         matches!(self, Readiness::Ready)
     }

@@ -138,6 +138,14 @@ The service reports **not ready** until the artifact is validated, the model and
 tokenizer are loaded, and a warmup forward has succeeded, so an orchestrator
 never routes traffic to a cold instance.
 
+**Graceful shutdown.** On `SIGTERM` (what Kubernetes sends on pod termination)
+or `SIGINT`, the service stops accepting new requests, lets in-flight
+classifications finish, logs a final metrics line, and exits `0`. The drain is
+bounded by `LLM_D_SC_SHUTDOWN_GRACE_SECS` (default 20s, chosen to fit inside
+Kubernetes' default 30s `terminationGracePeriodSeconds`); whatever is still
+open when the grace elapses is severed, and a second signal during the drain
+terminates immediately.
+
 `LLM_D_SC_CLASSIFIER` selects a taxonomy. It accepts a built-in name or a path
 to your own definition, and the model directory must match the classifier it was
 calibrated against. See [docs/classifiers.md](docs/classifiers.md).

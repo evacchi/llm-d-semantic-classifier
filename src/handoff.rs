@@ -9,8 +9,11 @@
 //! Queue stage.
 //!
 //! Deliberately NOT implemented here (0.20 per VERSIONS.md / ADR-0002): per-job
-//! deadlines, queued-request cancellation, load shedding policy, graceful drain,
-//! and worker-failure isolation.
+//! deadlines, queued-request cancellation, load shedding policy, and
+//! worker-failure isolation. Graceful drain is NOT in this list anymore: it
+//! lives one level up, in [`crate::grpc::classify::ClassifyServer::shutdown`]
+//! (stop admission, let queued and in-flight jobs finish, bound the wait),
+//! because the drain decision belongs to the server lifecycle, not the handoff.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;

@@ -80,6 +80,7 @@ fn parse_grpc_timeout(value: &str) -> Option<Duration> {
     }
 }
 
+use crate::runtime::Readiness;
 /// The generated tonic (async) service trait.
 pub use generated::classify_server::Classify as ClassifyTrait;
 
@@ -88,14 +89,31 @@ pub use generated::classify_server::Classify as ClassifyTrait;
 /// Binds a real TCP listener (an ephemeral port when given `:0`), serves the
 /// tonic classify service on a private Tokio runtime in the background, and
 /// reports the actual bound address via [`ClassifyServer::local_addr`].
+///
+/// Graceful shutdown (U-035): [`ClassifyServer::shutdown`] stops admission
+/// (the accept loop ends, so no new connection or request is accepted) and lets
+/// in-flight requests finish; [`ClassifyServer::shutdown_blocking`] bounds the
+/// drain with a grace period. A server that is merely dropped keeps its
+/// runtime alive until drop tears it down (a hard stop), so callers that care
+/// about in-flight work must drain explicitly.
 pub struct ClassifyServer {
-    /// Held so the background serving runtime stays alive for the struct's
-    /// lifetime; never read directly (hence the underscore prefix).
-    _runtime: tokio::runtime::Runtime,
+    /// The private runtime serving gRPC in the background. Read directly by
+    /// [`ClassifyServer::shutdown_blocking`] to block on the drain.
+    runtime: tokio::runtime::Runtime,
     addr: std::net::SocketAddr,
     metrics: Metrics,
     telemetry: Telemetry,
-    readiness: crate::runtime::Readiness,
+    /// LIVE readiness over a watch channel (not a fixed snapshot), so it can
+    /// flip to [`Readiness::Draining`] when shutdown begins
+    /// (I-013: the readiness flip is observable BEFORE the drain finishes).
+    readiness: tokio::sync::watch::Receiver<Readiness>,
+    /// The sending half of the readiness watch: sending
+    /// [`Readiness::Draining`] begins graceful shutdown.
+    drain: tokio::sync::watch::Sender<Readiness>,
+    /// Handle to the background serve task. It completes exactly when the
+    /// graceful drain finishes (all connections closed), so awaiting it is
+    /// awaiting the drain. `None` only after [`ClassifyServer::shutdown_blocking`].
+    serving: Option<tokio::task::JoinHandle<()>>,
     accepted: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
@@ -338,13 +356,7 @@ impl ClassifyServer {
             metrics.clone(),
             DEFAULT_QUEUE_BOUND,
         );
-        Self::serve(
-            addr,
-            service,
-            metrics,
-            telemetry,
-            crate::runtime::Readiness::Ready,
-        )
+        Self::serve(addr, service, metrics, telemetry, Readiness::Ready)
     }
 
     /// Bind a classify server that records its latency/cache counters into the
@@ -366,13 +378,7 @@ impl ClassifyServer {
             metrics.clone(),
             DEFAULT_QUEUE_BOUND,
         );
-        Self::serve(
-            addr,
-            service,
-            metrics,
-            telemetry,
-            crate::runtime::Readiness::Ready,
-        )
+        Self::serve(addr, service, metrics, telemetry, Readiness::Ready)
     }
 
     /// Bind a classify server serving the RESIDENT Candle classifier.
@@ -448,13 +454,28 @@ impl ClassifyServer {
             DEFAULT_QUEUE_BOUND,
             semantic,
         );
-        Self::serve(
-            addr,
-            service,
-            metrics,
-            telemetry,
-            crate::runtime::Readiness::Ready,
-        )
+        Self::serve(addr, service, metrics, telemetry, Readiness::Ready)
+    }
+
+    /// Bind a classify server serving ANY [`ClassifierRuntime`].
+    ///
+    /// TEST/HARNESS path: serves an arbitrary backend (e.g. a controllable slow
+    /// classifier in `tests/graceful_shutdown.rs`) over the full real server
+    /// surface — bounded executor, metrics, telemetry — without model weights.
+    /// Production uses [`ClassifyServer::bind_with_classifier`] instead.
+    pub fn bind_with_runtime<R>(addr: impl AsRef<str>, runtime: R) -> io::Result<ClassifyServer>
+    where
+        R: crate::classify::ClassifierRuntime + Send + Sync + 'static,
+    {
+        let metrics = Metrics::new();
+        let telemetry = Telemetry::new();
+        let service = ClassifyServiceImpl::with_executor(
+            runtime,
+            telemetry.clone(),
+            metrics.clone(),
+            DEFAULT_QUEUE_BOUND,
+        );
+        Self::serve(addr, service, metrics, telemetry, Readiness::Ready)
     }
 
     /// Bind and serve any tonic classify service on a private Tokio runtime.
@@ -463,7 +484,7 @@ impl ClassifyServer {
         service: ClassifyServiceImpl<R>,
         metrics: Metrics,
         telemetry: Telemetry,
-        readiness: crate::runtime::Readiness,
+        readiness: Readiness,
     ) -> io::Result<ClassifyServer>
     where
         R: crate::classify::ClassifierRuntime + Send + Sync + 'static,
@@ -514,29 +535,106 @@ impl ClassifyServer {
                 conn
             },
         );
+        // U-035 graceful shutdown: the serve future is wrapped with tonic's
+        // graceful shutdown. When the watch flips to Draining (or the server is
+        // dropped, closing the channel), the accept loop stops and existing
+        // connections are told to finish (HTTP/2 GOAWAY). The serve future then
+        // completes once every connection has closed — in-flight requests are
+        // NOT dropped — which is exactly what `shutdown_blocking` awaits.
+        let (drain, readiness_rx) = tokio::sync::watch::channel(readiness);
+        let mut shutdown_signal = readiness_rx.clone();
+        let graceful = async move {
+            // Resolves when readiness flips to Draining, or when the sender is
+            // dropped (server dropped without an explicit drain — the runtime
+            // teardown then cancels the task anyway, this just never hangs it).
+            let _ = shutdown_signal
+                .wait_for(|r| matches!(r, Readiness::Draining))
+                .await;
+        };
         let serve = tonic::transport::Server::builder()
             .add_service(service)
-            .serve_with_incoming(incoming);
+            .serve_with_incoming_shutdown(incoming, graceful);
 
-        runtime.spawn(serve);
+        // The serve task completes when the graceful drain finishes. A serve
+        // error after bind (e.g. a service-layer accept failure) is logged here
+        // rather than propagating: the drain still needs to complete, and
+        // `shutdown_blocking` awaits the task, not its success.
+        let serving = runtime.spawn(async move {
+            if let Err(e) = serve.await {
+                eprintln!("llm-d-sc: serve task ended with an error: {e}");
+            }
+        });
 
         Ok(ClassifyServer {
-            _runtime: runtime,
+            runtime,
             addr: bound,
             metrics,
             telemetry,
-            readiness,
+            readiness: readiness_rx,
+            drain,
+            serving: Some(serving),
             accepted,
         })
+    }
+
+    /// Begin graceful shutdown (idempotent).
+    ///
+    /// U-035: stops ADMISSION — the accept loop ends, so no new connection or
+    /// request is accepted — flips readiness to
+    /// [`Readiness::Draining`] (I-013), and lets in-flight
+    /// requests finish. This method only SIGNALS; pair it with
+    /// [`ClassifyServer::shutdown_blocking`] to also WAIT for the drain, or
+    /// poll [`ClassifyServer::readiness`].
+    pub fn shutdown(&self) {
+        let _ = self.drain.send(Readiness::Draining);
+    }
+
+    /// Begin graceful shutdown and BLOCK until in-flight work drains, for at
+    /// most `grace`.
+    ///
+    /// Returns `Ok(())` when every connection closed cleanly within `grace`
+    /// (admitted work completed). Returns `Err(TimedOut)` when the grace period
+    /// elapsed — the server is then force-dropped on return, severing whatever
+    /// is still open, so a caller can bound total shutdown time the way
+    /// Kubernetes bounds it with `terminationGracePeriodSeconds`.
+    pub fn shutdown_blocking(self, grace: Duration) -> io::Result<()> {
+        self.shutdown();
+        let ClassifyServer {
+            runtime,
+            serving,
+            drain,
+            readiness,
+            ..
+        } = self;
+        // Our watch halves go out of scope here, before the runtime: the serve
+        // task's signal future holds its own receiver and no longer needs ours.
+        drop(drain);
+        drop(readiness);
+        let serving = serving.expect("serve task handle must be present");
+        let drained =
+            runtime.block_on(async { tokio::time::timeout(grace, serving).await.is_ok() });
+        if drained {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "graceful drain did not complete within {grace:?}; forcing shutdown with \
+                     whatever was still in flight"
+                ),
+            ))
+        }
     }
 
     /// Current readiness.
     ///
     /// A successfully bound server reports READY; a real model dir that fails
     /// load/warmup never constructs a server, so readiness is never claimed for
-    /// a directory that merely exists (AC-002).
-    pub fn readiness(&self) -> crate::runtime::Readiness {
-        self.readiness
+    /// a directory that merely exists (AC-002). After [`ClassifyServer::shutdown`]
+    /// it reports DRAINING — admission has stopped while in-flight work is
+    /// still finishing (I-013).
+    pub fn readiness(&self) -> Readiness {
+        *self.readiness.borrow()
     }
 
     /// The actual bound address (resolved after an ephemeral `:0` bind).
