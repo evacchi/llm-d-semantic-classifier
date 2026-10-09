@@ -2,253 +2,200 @@
 
 Where `llm-d-sc` goes next, and why in that order.
 
-This document is a proposal for discussion, not a commitment. Dates are
-deliberately absent: the sequence is argued from dependency and evidence, and
-phases land when their exit criteria are met.
+This is a proposal for discussion, not a commitment. Work is organized as
+parallel workstreams, not as strictly sequential phases: reliability fixes and
+measurement must continue throughout, while the product tracks can progress at
+different rates. `docs/known-gaps.md` remains the authoritative record of what
+is missing today; this document explains the intended direction and priority.
 
-It complements [`docs/known-gaps.md`](docs/known-gaps.md), which stays the
-authoritative list of *current limitations*. Known gaps answers "what is missing
-today"; this answers "what we do about it, in what order, and how we will know
-it worked." Where a gap already carries a phase number, the mapping is called
-out so the two documents do not drift.
+## Product direction
 
-## The argument
+The project supports two distinct classification workloads. They have different
+contracts, ownership boundaries, and optimization goals, so the roadmap keeps
+them separate.
 
-The v0.2 benchmark campaign
-([data](https://github.com/cnuland/llm-d-sc-v0.2-benchmarking)) changed what the
-most urgent work is. Three results drive the ordering below.
+### Zero/one-shot classification: always classify
 
-**1. Saturation is invisible, and it looks like a speed-up.** Above the
-classifier's capacity the service does not queue and does not error. It fails
-open: requests bypass classification and take the fast default path. At 4,000
-req/s offered, classification coverage is **34.4%** — 65.6% of traffic reaches a
-backend unclassified — with **zero errors at every rate** and a p50 that
-*improves* from 564 ms to 2.03 ms. Throughput tracks the offered rate exactly.
-Every signal an operator normally watches reports a system that is healthy and
-getting better.
+The primary near-term workload is request-intrinsic classification over an
+unordered domain of labels. For every eligible request, `llm-d-sc` should
+produce a classification (or an explicit low-confidence/abstention result).
+Examples include domain, sensitivity, safety, intent, language, modality, and
+coarse complexity.
 
-**2. Capacity is a hard ceiling, and the forward is the floor.** On three
-replicas, coverage holds above 99% to **~1,200 req/s**, then capacity pins at
-**~1,390 classifications/sec** from 1,600 req/s upward regardless of offered
-load. Per-replica ceiling is **~463/s**, unchanged across v0.2 — the model
-forward is the floor. v0.2 did not make the classifier faster; it made capacity
-reachable, lifting max deployable capacity from ~480/s to ~1,390/s by fixing
-horizontal scaling.
+This is the natural home for anchor-based engineering. A user supplies or
+updates labelled anchors; the service embeds them and ranks a request against
+the configured label set. It should work without retraining, use small
+CPU-friendly models, and build first on model types and implementations that
+are already robust in the project.
 
-**3. Approximate caching on the input does not work for this task.** The L0 text
-prefilter was built specifically to key on text and consult before the forward.
-Measured against the full model on 6,000 real prompts, error rate stayed flat at
-7.6–10.2% from J≥0.50 to J≥0.80 while hit rate collapsed from 50% to 4.6%:
-**text similarity and label agreement are near-independent.** The L2 semantic
-tier is separately mis-placed — its key is the forward's output, so a hit saves
-microseconds and costs a network round trip. Exact caching remains the only
-caching that pays.
+Candidate-conditioned scoring is a related, but distinct, signature:
+`score = f(request, candidate)`. The Gateway supplies eligible candidates and
+`llm-d-sc` returns suitability per candidate. The Gateway retains the final
+selection responsibility, combining those scores with cost, policy, data
+sovereignty, endpoint health, capacity, latency, and stickiness.
 
-Taken together: **make saturation visible and act on it automatically, then
-reduce forwards per decision, then widen what the classifier can decide, then
-deepen how gateways use it.** Because the forward is the floor and approximate
-caching is refuted, throughput now comes from exactly two places: making the
-forward cheaper, or performing fewer of them.
+### Multi-turn classification: classify when needed
 
-| Phase | Theme | Question it answers |
+The second workload is classification over an ordered set of labels or states
+across a conversation. It should not run blindly on every turn. The Gateway
+owns session identity, turn accounting, and routing state; it asks for a
+reclassification when a material change is detected or policy requires it—for
+example, a change in saturation, flow-control state, or another routing-relevant
+conversation signal.
+
+This avoids treating session state as an implementation detail of a stateless
+classifier. The classifier supplies scores and a stable contract; the Gateway
+decides when to invoke it and how to prevent route flapping.
+
+## Delivery priorities
+
+1. **Production foundations first.** Fix correctness issues and add the
+   observability, health, lifecycle, and deployment infrastructure needed to
+   operate the service safely.
+2. **Benchmark and evaluate continuously.** Carry benchmarking, model
+   evaluation, and refinement with the AI Innovation team/MLflow alongside
+   every workstream; do not defer evidence until the end of a phase.
+3. **Prioritize existing support and configurable anchors.** Start from the
+   supported embedding/anchor path and small models that work well on CPU.
+   Select models using repeatable evidence before adding new runtime families.
+4. **Defer complex architectures.** Explore Vela, decision models,
+   Jev-like models, and vLLM-backed paths only after the core workload and its
+   evaluation baseline are established.
+
+The v0.2 campaign makes the production priority concrete: saturation can fail
+open and appear healthy, approximate input caching did not predict label
+agreement, and the model forward sets the observed throughput floor. Those are
+reasons to improve observability and evaluate each change, not reasons to make
+low-level throughput optimization the first product milestone.
+
+---
+
+## Workstream 1 — Production foundations
+
+This is the first delivery priority and remains active for the lifetime of the
+project. It covers bug fixes, observability, and the operational infrastructure
+that makes benchmark and production results trustworthy.
+
+| Work | Outcome | Existing issue |
 | --- | --- | --- |
-| 1 | Operability | Can you run this in production and know it is working? |
-| 2 | Fewer forwards, cheaper forwards | Can you serve more traffic per replica? |
-| 3 | Widen the decision | Can it answer questions beyond complexity? |
-| 4 | Integration depth | Do gateways use it well? |
+| Metrics endpoint | Export classification coverage, per-stage latency histograms, queue depth, admission rejections, cache hit ratio by tier, and classifier/model revision and digest. | [#11](https://github.com/llm-d-incubation/llm-d-semantic-classifier/issues/11) |
+| Coverage alert and semantics | Document coverage as `classified / total`; distinguish an invalid zero-delta read from genuine 0%, and count `LOW_CONFIDENCE`, `UNMAPPED_LABEL`, and `ABSTAIN` as completed classifications. | new |
+| Health-check endpoint | Expose readiness so an orchestrator can probe actual service state. | known gaps |
+| Graceful drain on shutdown | Define drain semantics so scaling or rollout does not drop in-flight work. | [#13](https://github.com/llm-d-incubation/llm-d-semantic-classifier/issues/13) |
+| Cache-hit admission fix | Ensure a cache hit cannot be rejected with `RESOURCE_EXHAUSTED`. | [#2](https://github.com/llm-d-incubation/llm-d-semantic-classifier/issues/2) |
+| Exact-cache eviction | Replace FIFO with LRU where measurements show exact caching is valuable. | [#9](https://github.com/llm-d-incubation/llm-d-semantic-classifier/issues/9) |
+| CPU-limited deployment behavior | Benchmark and document the service under pod CPU limits rather than relying on unconstrained-host figures. | [#14](https://github.com/llm-d-incubation/llm-d-semantic-classifier/issues/14) |
+| Scaling investigation | Establish replica linearity under demand-sufficient load before deciding whether coverage-keyed autoscaling is warranted. | new |
 
-```note
-the phasing is thematic instead of time-based. some of these themes can be carried in 
-parallel so goals should be rearrenged
+Coverage-keyed autoscaling is deliberately an investigation, not a committed
+near-term feature. It depends on the metrics, alert semantics, and scaling
+evidence above. Per-request cancellation is also deferred until it is shown to
+matter for an active workload.
 
-e.g. some degree of bugfixing + benchmark should go on every phase; first phase
-should deal with benchmarking and selecting models with simplest model coming first;
-we should prioritize models we already have and have robust impl for that.
-```
-
-
-Two tracks run across all four: **evaluation integrity** and **project
-hygiene**.
-
----
-
-## Phase 1 — Operability
-
-Nothing else is safe to deploy until an operator can see saturation. This phase
-is a hard prerequisite for Phase 2's throughput claims being verifiable in
-production rather than only on a bench.
-
-| Work | Notes | Existing issue | NOTES |
-| --- | --- | --- | --- |
-| Metrics endpoint | `llm_d_sc_classify_total` already carries a `classified` dimension, so coverage is an unambiguous ratio. What is missing is the scrape surface: a Prometheus or OpenTelemetry endpoint exporting it alongside per-stage histograms, queue depth, admission rejections, cache hit ratio **by tier**, and classifier/model revision and digest as labels. | [#11](https://github.com/llm-d-incubation/llm-d-semantic-classifier/issues/11) — currently phased 0.3; proposed to move first | OK |
-| Ship the coverage alert, not just the metric | Coverage is the only signal that detects saturation, so the alert rule ships with it: `sum(rate(llm_d_sc_classify_total{classified="true"}[5m])) / sum(rate(llm_d_sc_classify_total[5m]))`. Two traps to document: a **zero delta is an invalid read, not 0%**, and `LOW_CONFIDENCE` / `UNMAPPED_LABEL` / `ABSTAIN` are *successful* classifications the router declined to act on, so counting only `OK` under-reports. | new |  UNCLEAR |
-| Confirm linearity past two replicas | Two replicas measured 2.04x after the filter's pinned channel and a single-host `nodeSelector` were both fixed. The three-replica arm reads 2.09x but was demand-limited, and at n=1 per arm a 2% delta is not a signal. Needs one demand-sufficient arm at four or more replicas before autoscaling is built on an assumption of linearity. | new |
-| Coverage-keyed autoscaling | Only after the above two. A default HPA on CPU or request rate **will never fire**: at 34% coverage the service looks healthy by every one of those signals. Scaling on coverage is what makes this different from stock autoscaling. | new | UNCLEAR |
-| Per-request deadlines and cancellation | A queued request the caller has abandoned should not consume a forward. | [#12](https://github.com/llm-d-incubation/llm-d-semantic-classifier/issues/12) |  IRRELEVANT AT THIS TIME |
-| Graceful drain on shutdown | An autoscaler that removes pods needs defined drain semantics or it drops in-flight work. | [#13](https://github.com/llm-d-incubation/llm-d-semantic-classifier/issues/13) |  OK |
-| Health-checking endpoint | Readiness is internal state today; an orchestrator cannot probe it. | known-gaps, phase 0.3 | OK |
-| Behaviour under pod CPU limits | Every published number comes from an unconstrained host and will not transfer directly to a limited pod. | [#14](https://github.com/llm-d-incubation/llm-d-semantic-classifier/issues/14) | OK, BENCHMARKING THEME |
-
-**Exit criteria**
-
-- Coverage is exported, documented, and alertable, with invalid reads
-  distinguishable from genuine zero.
-- Classification throughput is measured at four or more replicas under
-  demand-sufficient load and scales within 10% of linear, or the ceiling is
-  explained and documented.
-- A cluster adds replicas in response to coverage degradation, and drains them
-  without dropping in-flight work.
-- Published throughput figures exist for a CPU-limited pod.
+**Success criteria:** operators can probe the service, observe classification
+coverage and saturation, safely drain it, and reproduce CPU-constrained
+throughput figures.
 
 ---
 
-## Phase 2 — Fewer forwards, cheaper forwards
+## Workstream 2 — Continuous benchmarking, evaluation, and model selection
 
-The forward is ~31 ms against microseconds for ranking, and the per-replica
-ceiling of ~463/s has not moved across v0.2. Two of the obvious levers are
-already closed: the L0 text prefilter was built and measured as a failure, and
-the L2 semantic tier is mis-placed by construction. **Caching on input
-similarity is not the lever it appeared to be**, which leaves exactly two
-routes — make the forward cheaper, or perform fewer of them.
+Benchmarking is not a later phase. Every material runtime, model, anchor, and
+contract change needs a comparable evaluation row. Coordinate the refinement
+loop with the AI Innovation team and MLflow so datasets, runs, artifacts, and
+results are traceable.
 
-| Work | Notes | Existing issue | NOTES |
-| --- | --- | --- | --- |
-| Batch concurrent misses through one forward | The clearest remaining multiplier on per-replica capacity, and it operates in exactly the regime that saturates. | [#16](https://github.com/llm-d-incubation/llm-d-semantic-classifier/issues/16) |LOW-LEVEL OPT -- POSSIBLY LOW HANGING FRUIT -- NOT HIGH PRIO |
-| Quantisation and shape discipline | INT8 or dynamic quantisation, bucketed padding instead of per-request shapes, an explicit `max_seq_len` truncation policy, encoder attention kernels. The forward is 99.4% of request latency and ~463/s per replica is the floor it sets, so this is the only work that moves the per-replica number itself. | new | SAME AS ABOVE |
-| Session-scoped classification | Promoted here from integration work because it is now a **primary throughput lever**, not only a stability one. Complexity is largely a property of a conversation, not a turn. Classifying once per session with an exponentially weighted average across turns reduces forwards per conversation directly — and with input-similarity caching refuted, session reuse is the main remaining way to do fewer forwards. | new |  THIS HAS MORE TO DO WITH SESSION VS ZERO-SHOT, WORK FOR GATEWAY NOT CLASSIFIER; PRIORITIZE ZERO-SHOT WORKLOAD? |
-| Cache hits must not pass through admission | A hit costs 632 ns and can currently be rejected with `RESOURCE_EXHAUSTED`. | [#2](https://github.com/llm-d-incubation/llm-d-semantic-classifier/issues/2) | BUGFIX OK |
-| FIFO to LRU eviction | Exact caching is the only caching that pays, so its hit rate is worth the recency bookkeeping. | [#9](https://github.com/llm-d-incubation/llm-d-semantic-classifier/issues/9) | OK |
-| Auto-tune executor width | `RAYON_NUM_THREADS=1` measured 3.25x faster than 4 at the same worker count — intra-op parallelism competes with the worker pool for cores. That constant is hardware-specific and will be wrong elsewhere, so it should be discovered at startup rather than documented. | known-gaps, phase 0.2 | BENCHMARK/PERF THEME |
-| vLLM as an optional inference backend | Scoped honestly: for a 23M-parameter MiniLM, vLLM is unlikely to win on single-request latency and adds a hop. The plausible wins are continuous batching at high offered rates and operating one engine instead of two. Implement behind the existing backend seam and A/B against Candle at matched load; adopt only if it moves ~463/s per replica. | new | LOW-PRIO, FOCUS ON CPU + EMBEDDED? |
-| Recover the trained head's 12.3% | The head costs 12.3% of classification throughput against anchor cosine on saturated arms, and it is worth paying because anchor cosine scored below a constant classifier on 3 of 5 signals. But the cost is one extra matmul on a forward that dominates everything, so it should be recoverable by fusing it into the forward rather than by reverting the decision rule. | new | EXPLORATION/BUGFIX; BENCHMARK? |
+| Work | Outcome |
+| --- | --- |
+| Reproduce benchmark results | Obtain an independent run on a second environment and record hardware, limits, load shape, and model revision. |
+| Evaluate supported models first | Compare the existing supported embedding models and trained-head/anchor variants before introducing another architecture. Favor small CPU-friendly models. |
+| Improve evaluation integrity | Continue blind label adjudication, publish the estimated gold-label ceiling with accuracy, and use the contested split to refine taxonomy or measure abstention. |
+| Evaluate configurable anchors | Measure configurable anchor sets, their stability, and their accuracy by label domain; custom anchors are an extension of current support, not a new runtime family. |
+| Resolve unexplained backend results | Investigate the vLLM Semantic Router timeout-like benchmark arm before treating it as capacity evidence. |
+| MLflow and AI Innovation coordination | Track datasets, artifacts, model revisions, evaluation runs, and proposed refinement or fine-tuning work with the partner teams. |
 
-**Not planned, and why.** Recording these so they are not proposed again:
+Performance experiments such as batching concurrent misses, quantization,
+shape discipline, executor-width tuning, and fusing the trained head belong in
+this workstream. They are worthwhile when profiling and benchmark evidence
+identifies them as the next constraint; they are not ahead of correctness,
+operability, or core model selection.
 
-- **L0 text prefilter.** Built, measured on 6,000 real prompts against the full
-  model, rejected. Error rate is flat at 7.6–10.2% across J≥0.50 to J≥0.80
-  while hit rate collapses 50% → 4.6%. Text similarity does not predict label
-  agreement, so there is no threshold that is both safe and useful.
-- **Re-keying the L2 semantic tier.** Follows from the same result: any
-  pre-forward key available to us is a text key.
-
-A caching proposal should only be reopened by a key that predicts the *label*
-rather than the *text*.
-
-**Exit criteria**
-
-- Per-replica classification ceiling moves measurably above ~463/s, or the
-  forward is shown to be irreducible on this hardware.
-- Coverage holds above 99% beyond ~1,200 req/s on three replicas.
-- Forwards per conversation fall measurably under session-scoped
-  classification, with routing stability no worse.
+**Success criteria:** comparable runs are reproducible, model selection is
+evidence-led, and every promoted artifact has a traceable evaluation record.
 
 ---
 
-## Phase 3 — Widen the decision
+## Workstream 3 — Always-classify zero/one-shot domains
 
-| Work | Notes | Existing issue | NOTES |
-| --- | --- | --- | --- |
-| Sequence-classification runtime adapter | Hard dependency for everything else in this phase. The 0.1 backend ranks embeddings against anchors and cannot serve a sequence-classification model, which is why such artifacts are deliberately not offered by `hack/fetch-model`. | [#7](https://github.com/llm-d-incubation/llm-d-semantic-classifier/issues/7) |SHOULD GO TOGETHER WITH MODEL EXPLORATIONS THEME|
-| **Domain routing with user-supplied anchors** | The design commitment worth making: **a user should not have to train a model to route their own domains.** Classification here is a thin layer over the embedding — encode the query and a set of labelled anchors, take the class with the highest top-k mean cosine. So accept roughly 20 examples per class as configuration, embed them at startup, and rank at request time. Ranking is microseconds, so the runtime cost is near zero. Offer contrastive fine-tuning as the *upgrade* path for taxonomies where zero-shot anchors are not separable — see Red Hat AI Innovation Team's [Embedding SFT](https://ai-innovation.team/training_hub/#/algorithms/embedding_sft) in `training_hub`, whose canonical use case is exactly semantic routing. | known-gaps, phase 0.4 | EXCEPT FOR FINE-TUNING WE ALREADY SUPPORT UPDATING ANCHORS SO SPLIT INTO 2 AND MOVE CUSTOM ANCHORS UP? |
-| Candidate-aware classification and model-affinity scoring | Today the service answers "how complex is this prompt?" in isolation. Routing actually needs "which of *these* candidate models suits this prompt?", which is a different function with a different signature. This is probably the largest single product differentiator available. | [#18](https://github.com/llm-d-incubation/llm-d-semantic-classifier/issues/18) | RERANK/MOVE UP: THIS HAS TO DO WITH TARGET USE CASES: Two classes of signal, with different function signatures.
+Build the primary product path around small supported models and configurable
+anchors. The label set is unordered and classification is attempted for every
+eligible request. The service must make uncertainty explicit rather than
+silently converting it to a routing decision.
 
-Request-intrinsic — score = f(request). Domain, sensitivity, safety,
-intent, language, modality, and coarse complexity. These stay exactly as they
-are; 0.1 does not become obsolete.
-
-Candidate-conditioned — score = f(request, candidate). Model affinity,
-capability fit, probability of success, tool-use and reasoning suitability.
-
-The Gateway supplies the eligible candidates. llm-d-sc returns per-candidate
-suitability. The Gateway then combines that with cost, policy, data sovereignty,
-endpoint health, capacity, latency and stickiness to select. |
-| Multidimensional evaluation | Evaluate on a second axis — candidate model type — rather than label accuracy alone. Required to make the item above assessable; a model-affinity claim cannot be scored by a single-axis accuracy number. | new | THIS IS JUST MULTIPLE CLASSIFIERS + WEIGHTING, CAN BE DONE AT PRAXIS LEVEL? |
-| Additional decision model families | Gate behind the adapter and a stable backend trait, and require each new family to land with a multidimensional eval row rather than a claim. | new | LOW PRIORITY, FOCUS ON FEW MODEL FAMILIES AT FIRST, GROUP WITH VLLM EXPLORATION |
-| `ABSTAIN` on insufficient context | The project already publishes a `contested` split: roughly 26–30% of real prompts where three independent jurors do not agree. That is a measured map of where the taxonomy does not resolve. A principled abstention into fallback is better than a confident wrong route. | [#8](https://github.com/llm-d-incubation/llm-d-semantic-classifier/issues/8) |OK|
-
-**Exit criteria**
-
-- A user adds a domain taxonomy from configuration alone — no rebuild, no
-  retraining — and gets a measured accuracy report for it.
-- Candidate-aware scoring is evaluated on both axes and published.
-- `ABSTAIN` rate on the `contested` split is materially higher than on the
-  unanimous split.
-
----
-
-## Phase 4 — Integration depth
-
-| Work | Notes | REVIEW NOTES |
+| Work | Outcome | Existing issue |
 | --- | --- | --- |
-| Session identity and turn accounting at the gateway | The classification half of this lands in Phase 2 as a throughput lever. What remains here is the gateway contract: who owns session identity, how turns are counted across a conversation, and how a mid-session re-classification is signalled so routing does not flap. | MIGHT BE WORTH JOINING ON THE SAME PHASE? |
-| Explicit fallback contract | Fail-open is currently emergent behaviour discovered in a benchmark. It should be a configurable, documented policy that emits a signal when it engages. | OK |
-| Infrastructure-aware routing | Accept queue-depth and KV-cache-pressure signals so tier selection and pod selection compose rather than compete. | SHOULD BE DONE IN THE GATEWAY |
-| Decision cache sharing | Gateway and classifier cache independently today. A shared decision cache across gateway replicas raises the effective hit rate, and the hit rate is the knee. | OK FUTURE WORK |
+| Make anchor configuration a first-class contract | Document and harden the existing ability to update labelled anchors; define configuration, startup embedding, versioning, and reproducibility expectations. | known gaps |
+| Domain routing with user-supplied anchors | Allow a domain taxonomy to be supplied without a rebuild or mandatory training; rank requests against labelled anchors. | known gaps |
+| Explicit `ABSTAIN` / low-confidence behavior | Return an honest result when context or taxonomy separation is insufficient, with observable downstream fallback. | [#8](https://github.com/llm-d-incubation/llm-d-semantic-classifier/issues/8) |
+| Candidate-conditioned scoring contract | Add `f(request, candidate)` only where the use case needs model-affinity or capability-fit scores; preserve request-intrinsic classification as its own contract. | [#18](https://github.com/llm-d-incubation/llm-d-semantic-classifier/issues/18) |
+| Fine-tuning as an upgrade path | Explore AI Innovation embedding SFT or equivalent only for taxonomies that measured anchor separation cannot support. | future refinement |
 
-**Exit criteria**
+Evaluation of multiple classifier signals and their weighting may be composed at
+the Praxis/Gateway layer where appropriate. `llm-d-sc` should expose clear,
+independently evaluable scores rather than take ownership of policy and final
+routing selection.
 
-- Session-mode classification demonstrably reduces classifications per
-  conversation and reduces route changes per conversation.
-- Fail-open is configurable and observable.
+**Success criteria:** a user can configure an unordered domain label set with
+anchors, receive a classification for each eligible request, and see an
+explicit, observable uncertainty result when it cannot be resolved.
 
 ---
 
-## Cross-cutting: evaluation integrity
+## Workstream 4 — Multi-turn, conditional classification
 
-The evaluation has a measured ceiling, and it changes where accuracy work
-should go.
+This workstream is jointly defined with the Gateway. It models ordered labels
+or states over time and invokes classification only when needed—not as a
+per-turn replacement for zero/one-shot classification.
 
-Gold labels were audited by blind paired adjudication in two strata — the rows
-the model got wrong *and* a sample of the rows it got right — with the judge
-shown two candidate labels in random order and no indication of provenance.
-**Roughly 4.9% of gold labels are themselves wrong**, so a perfect classifier
-scored against this eval reaches about 0.95, not 1.0. Measured real-traffic
-accuracy is 0.8963.
+| Work | Outcome |
+| --- | --- |
+| Session and turn contract | Define Gateway ownership of session identity, turn count, classification state, and score provenance. |
+| Reclassification triggers | Specify material-change triggers, including saturation or flow-control changes and conversation signals relevant to routing. |
+| Stable routing behavior | Define hysteresis, update signaling, and fallback behavior so a session does not flap between routes. |
+| Gateway integration | Keep infrastructure-aware routing, capacity, KV-cache pressure, policy, and final routing decisions in the Gateway. |
+| Decision-cache strategy | Explore cross-replica Gateway/classifier cache sharing only after the ownership and correctness contract is clear. |
 
-That leaves under six points of headroom, some of which is noise. **The
-remaining accuracy is in label quality and taxonomy resolution, not in model
-capacity.** Work accordingly:
+Session-scoped classification is therefore not a standalone classifier
+throughput optimization. Fewer forwards may be a beneficial consequence, but
+the principal deliverable is a correct Gateway–classifier contract for
+conditional reclassification.
 
-- Improve gold label quality and re-publish the ceiling estimate alongside any
-  accuracy figure, so the two are never read apart.
-- Treat the ~26–30% non-unanimous fraction as a taxonomy problem. Either the
-  tiers need sharper definitions or those prompts genuinely do not resolve, and
-  `ABSTAIN` is the honest answer.
-- Resolve the outstanding vLLM Semantic Router model arm before drawing
-  conclusions from it. The existing P5 data shows 43.3% coverage at only 400
-  req/s with p50 pinned at 1002–1003 ms and almost no variance, which is the
-  signature of a hard one-second timeout rather than a capacity limit. Those
-  numbers are currently unexplained, not a result.
-- **Independent reproduction.** Every published figure comes from one campaign,
-  on one cluster, run by one contributor. For a project whose differentiator is
-  measurement rigour, reproduction by a second party is a credibility
-  milestone worth scheduling rather than hoping for.
+**Success criteria:** the Gateway can demonstrate that it reclassifies only on
+defined triggers, preserves stable routing across a conversation, and records
+why each reclassification occurred.
 
-## Cross-cutting: project hygiene
+---
 
-Small, but each is an adoption blocker for someone.
+## Future work — Additional model architectures and backends
+
+Complex model families are intentionally deferred. They should enter through a
+stable adapter/backend boundary and only with a workload-specific evaluation
+plan—not merely because they are available.
+
+| Exploration | Entry condition |
+| --- | --- |
+| Sequence-classification runtime adapter | A selected model and benchmark show a need that the supported embedding/anchor path cannot meet. [#7](https://github.com/llm-d-incubation/llm-d-semantic-classifier/issues/7) |
+| vLLM backend | A/B evidence shows a material advantage for an intended workload over the embedded CPU-friendly path. |
+| Vela, decision models, and Jev-like architectures | A concrete classification use case, model artifact, integration contract, and evaluation dataset exist. |
+| Other decision-model families | A small initial set has demonstrated value; each additional family brings an evaluation row and maintenance owner. |
+
+---
+
+## Ongoing project hygiene
 
 | Work | Existing issue |
 | --- | --- |
-| Migrate default classifier artifacts out of a personal namespace into the `llm-d` organisation | [#6](https://github.com/llm-d-incubation/llm-d-semantic-classifier/issues/6) |
-| `fetch-model` must verify that present files match the pinned revision rather than skipping download | [#5](https://github.com/llm-d-incubation/llm-d-semantic-classifier/issues/5) |
-| Reconcile the cost classifier definition with `fetch-model`, and pin the mutable reference | [#1](https://github.com/llm-d-incubation/llm-d-semantic-classifier/issues/1) |
-| Refresh `known-gaps.md` now that cluster evidence exists | [#15](https://github.com/llm-d-incubation/llm-d-semantic-classifier/issues/15) |
-
----
-
-## Open questions for discussion
-
-1. **Does scaling stay linear past two replicas?** 1→2 measured 2.04x once the
-   filter's pinned channel and the single-host `nodeSelector` were fixed. The
-   three-replica arm was demand-limited, so linearity above two is assumed
-   rather than measured. Autoscaling policy depends on the answer.
-2. **How far should anchors be configurable before a ModelCar is required?**
-   There is a real trade-off between "drop examples in a ConfigMap" ergonomics
-   and reproducibility of a digest-pinned artifact.
-3. **Does vLLM as a backend justify its operational cost at 23M parameters?**
-   Worth deciding on measurement rather than on consistency with the rest of
-   the stack.
-4. **Should session-mode classification live here or in the gateway?** Keeping
-   session state in the classifier is simpler for callers and worse for
-   horizontal scale.
+| Migrate default classifier artifacts from a personal namespace to the `llm-d` organization | [#6](https://github.com/llm-d-incubation/llm-d-semantic-classifier/issues/6) |
+| Make `fetch-model` verify present files against the pinned revision | [#5](https://github.com/llm-d-incubation/llm-d-semantic-classifier/issues/5) |
+| Reconcile the cost-classifier definition with `fetch-model` and pin the mutable reference | [#1](https://github.com/llm-d-incubation/llm-d-semantic-classifier/issues/1) |
+| Refresh `known-gaps.md` as evidence and decisions change | [#15](https://github.com/llm-d-incubation/llm-d-semantic-classifier/issues/15) |
