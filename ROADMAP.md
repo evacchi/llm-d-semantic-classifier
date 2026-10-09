@@ -36,11 +36,13 @@ sovereignty, endpoint health, capacity, latency, and stickiness.
 
 ### Multi-turn classification: classify when needed
 
-The second workload is multi-turn classification over an set of labels. 
-It should not run blindly on every turn. The Gateway owns session identity, 
-turn accounting, and routing state; it asks for a reclassification when a 
-material change is detected or policy requires it—for example, a change in saturation, 
-flow-control state, or another routing-relevant conversation signal.
+The second workload is multi-turn classification over a set of labels or
+states. It should not run blindly on every turn. Switching models generally
+costs more than keeping a stable route because it forfeits reusable prefix and
+KV-cache state. The Gateway owns session identity, turn accounting, and routing
+state; it asks for a reclassification only when a material change is detected
+or policy requires it—for example, a change in saturation, flow-control state,
+or another routing-relevant conversation signal.
 
 This avoids treating session state as an implementation detail of a stateless
 classifier. The classifier supplies scores and a stable contract; the Gateway
@@ -154,7 +156,9 @@ explicit, observable uncertainty result when it cannot be resolved.
 
 This workstream is jointly defined with the Gateway. It models labels
 or states over time and invokes classification only when needed—not as a
-per-turn replacement for first-turn classification.
+per-turn replacement for first-turn classification. This protects routing
+stability and preserves prefix- and KV-cache reuse, which a model switch would
+usually discard.
 
 | Work | Outcome |
 | --- | --- |
