@@ -57,6 +57,16 @@ forward cheaper, or performing fewer of them.
 | 3 | Widen the decision | Can it answer questions beyond complexity? |
 | 4 | Integration depth | Do gateways use it well? |
 
+```note
+the phasing is thematic instead of time-based. some of these themes can be carried in 
+parallel so goals should be rearrenged
+
+e.g. some degree of bugfixing + benchmark should go on every phase; first phase
+should deal with benchmarking and selecting models with simplest model coming first;
+we should prioritize models we already have and have robust impl for that.
+```
+
+
 Two tracks run across all four: **evaluation integrity** and **project
 hygiene**.
 
@@ -68,16 +78,16 @@ Nothing else is safe to deploy until an operator can see saturation. This phase
 is a hard prerequisite for Phase 2's throughput claims being verifiable in
 production rather than only on a bench.
 
-| Work | Notes | Existing issue |
-| --- | --- | --- |
-| Metrics endpoint | `llm_d_sc_classify_total` already carries a `classified` dimension, so coverage is an unambiguous ratio. What is missing is the scrape surface: a Prometheus or OpenTelemetry endpoint exporting it alongside per-stage histograms, queue depth, admission rejections, cache hit ratio **by tier**, and classifier/model revision and digest as labels. | [#11](https://github.com/llm-d-incubation/llm-d-semantic-classifier/issues/11) — currently phased 0.3; proposed to move first |
-| Ship the coverage alert, not just the metric | Coverage is the only signal that detects saturation, so the alert rule ships with it: `sum(rate(llm_d_sc_classify_total{classified="true"}[5m])) / sum(rate(llm_d_sc_classify_total[5m]))`. Two traps to document: a **zero delta is an invalid read, not 0%**, and `LOW_CONFIDENCE` / `UNMAPPED_LABEL` / `ABSTAIN` are *successful* classifications the router declined to act on, so counting only `OK` under-reports. | new |
+| Work | Notes | Existing issue | NOTES |
+| --- | --- | --- | --- |
+| Metrics endpoint | `llm_d_sc_classify_total` already carries a `classified` dimension, so coverage is an unambiguous ratio. What is missing is the scrape surface: a Prometheus or OpenTelemetry endpoint exporting it alongside per-stage histograms, queue depth, admission rejections, cache hit ratio **by tier**, and classifier/model revision and digest as labels. | [#11](https://github.com/llm-d-incubation/llm-d-semantic-classifier/issues/11) — currently phased 0.3; proposed to move first | OK |
+| Ship the coverage alert, not just the metric | Coverage is the only signal that detects saturation, so the alert rule ships with it: `sum(rate(llm_d_sc_classify_total{classified="true"}[5m])) / sum(rate(llm_d_sc_classify_total[5m]))`. Two traps to document: a **zero delta is an invalid read, not 0%**, and `LOW_CONFIDENCE` / `UNMAPPED_LABEL` / `ABSTAIN` are *successful* classifications the router declined to act on, so counting only `OK` under-reports. | new |  UNCLEAR |
 | Confirm linearity past two replicas | Two replicas measured 2.04x after the filter's pinned channel and a single-host `nodeSelector` were both fixed. The three-replica arm reads 2.09x but was demand-limited, and at n=1 per arm a 2% delta is not a signal. Needs one demand-sufficient arm at four or more replicas before autoscaling is built on an assumption of linearity. | new |
-| Coverage-keyed autoscaling | Only after the above two. A default HPA on CPU or request rate **will never fire**: at 34% coverage the service looks healthy by every one of those signals. Scaling on coverage is what makes this different from stock autoscaling. | new |
-| Per-request deadlines and cancellation | A queued request the caller has abandoned should not consume a forward. | [#12](https://github.com/llm-d-incubation/llm-d-semantic-classifier/issues/12) |
-| Graceful drain on shutdown | An autoscaler that removes pods needs defined drain semantics or it drops in-flight work. | [#13](https://github.com/llm-d-incubation/llm-d-semantic-classifier/issues/13) |
-| Health-checking endpoint | Readiness is internal state today; an orchestrator cannot probe it. | known-gaps, phase 0.3 |
-| Behaviour under pod CPU limits | Every published number comes from an unconstrained host and will not transfer directly to a limited pod. | [#14](https://github.com/llm-d-incubation/llm-d-semantic-classifier/issues/14) |
+| Coverage-keyed autoscaling | Only after the above two. A default HPA on CPU or request rate **will never fire**: at 34% coverage the service looks healthy by every one of those signals. Scaling on coverage is what makes this different from stock autoscaling. | new | UNCLEAR |
+| Per-request deadlines and cancellation | A queued request the caller has abandoned should not consume a forward. | [#12](https://github.com/llm-d-incubation/llm-d-semantic-classifier/issues/12) |  IRRELEVANT AT THIS TIME |
+| Graceful drain on shutdown | An autoscaler that removes pods needs defined drain semantics or it drops in-flight work. | [#13](https://github.com/llm-d-incubation/llm-d-semantic-classifier/issues/13) |  OK |
+| Health-checking endpoint | Readiness is internal state today; an orchestrator cannot probe it. | known-gaps, phase 0.3 | OK |
+| Behaviour under pod CPU limits | Every published number comes from an unconstrained host and will not transfer directly to a limited pod. | [#14](https://github.com/llm-d-incubation/llm-d-semantic-classifier/issues/14) | OK, BENCHMARKING THEME |
 
 **Exit criteria**
 
@@ -101,16 +111,16 @@ the L2 semantic tier is mis-placed by construction. **Caching on input
 similarity is not the lever it appeared to be**, which leaves exactly two
 routes — make the forward cheaper, or perform fewer of them.
 
-| Work | Notes | Existing issue |
-| --- | --- | --- |
-| Batch concurrent misses through one forward | The clearest remaining multiplier on per-replica capacity, and it operates in exactly the regime that saturates. | [#16](https://github.com/llm-d-incubation/llm-d-semantic-classifier/issues/16) |
-| Quantisation and shape discipline | INT8 or dynamic quantisation, bucketed padding instead of per-request shapes, an explicit `max_seq_len` truncation policy, encoder attention kernels. The forward is 99.4% of request latency and ~463/s per replica is the floor it sets, so this is the only work that moves the per-replica number itself. | new |
-| Session-scoped classification | Promoted here from integration work because it is now a **primary throughput lever**, not only a stability one. Complexity is largely a property of a conversation, not a turn. Classifying once per session with an exponentially weighted average across turns reduces forwards per conversation directly — and with input-similarity caching refuted, session reuse is the main remaining way to do fewer forwards. | new |
-| Cache hits must not pass through admission | A hit costs 632 ns and can currently be rejected with `RESOURCE_EXHAUSTED`. | [#2](https://github.com/llm-d-incubation/llm-d-semantic-classifier/issues/2) |
-| FIFO to LRU eviction | Exact caching is the only caching that pays, so its hit rate is worth the recency bookkeeping. | [#9](https://github.com/llm-d-incubation/llm-d-semantic-classifier/issues/9) |
-| Auto-tune executor width | `RAYON_NUM_THREADS=1` measured 3.25x faster than 4 at the same worker count — intra-op parallelism competes with the worker pool for cores. That constant is hardware-specific and will be wrong elsewhere, so it should be discovered at startup rather than documented. | known-gaps, phase 0.2 |
-| vLLM as an optional inference backend | Scoped honestly: for a 23M-parameter MiniLM, vLLM is unlikely to win on single-request latency and adds a hop. The plausible wins are continuous batching at high offered rates and operating one engine instead of two. Implement behind the existing backend seam and A/B against Candle at matched load; adopt only if it moves ~463/s per replica. | new |
-| Recover the trained head's 12.3% | The head costs 12.3% of classification throughput against anchor cosine on saturated arms, and it is worth paying because anchor cosine scored below a constant classifier on 3 of 5 signals. But the cost is one extra matmul on a forward that dominates everything, so it should be recoverable by fusing it into the forward rather than by reverting the decision rule. | new |
+| Work | Notes | Existing issue | NOTES |
+| --- | --- | --- | --- |
+| Batch concurrent misses through one forward | The clearest remaining multiplier on per-replica capacity, and it operates in exactly the regime that saturates. | [#16](https://github.com/llm-d-incubation/llm-d-semantic-classifier/issues/16) |LOW-LEVEL OPT -- POSSIBLY LOW HANGING FRUIT -- NOT HIGH PRIO |
+| Quantisation and shape discipline | INT8 or dynamic quantisation, bucketed padding instead of per-request shapes, an explicit `max_seq_len` truncation policy, encoder attention kernels. The forward is 99.4% of request latency and ~463/s per replica is the floor it sets, so this is the only work that moves the per-replica number itself. | new | SAME AS ABOVE |
+| Session-scoped classification | Promoted here from integration work because it is now a **primary throughput lever**, not only a stability one. Complexity is largely a property of a conversation, not a turn. Classifying once per session with an exponentially weighted average across turns reduces forwards per conversation directly — and with input-similarity caching refuted, session reuse is the main remaining way to do fewer forwards. | new |  THIS HAS MORE TO DO WITH SESSION VS ZERO-SHOT, WORK FOR GATEWAY NOT CLASSIFIER; PRIORITIZE ZERO-SHOT WORKLOAD? |
+| Cache hits must not pass through admission | A hit costs 632 ns and can currently be rejected with `RESOURCE_EXHAUSTED`. | [#2](https://github.com/llm-d-incubation/llm-d-semantic-classifier/issues/2) | BUGFIX OK |
+| FIFO to LRU eviction | Exact caching is the only caching that pays, so its hit rate is worth the recency bookkeeping. | [#9](https://github.com/llm-d-incubation/llm-d-semantic-classifier/issues/9) | OK |
+| Auto-tune executor width | `RAYON_NUM_THREADS=1` measured 3.25x faster than 4 at the same worker count — intra-op parallelism competes with the worker pool for cores. That constant is hardware-specific and will be wrong elsewhere, so it should be discovered at startup rather than documented. | known-gaps, phase 0.2 | BENCHMARK/PERF THEME |
+| vLLM as an optional inference backend | Scoped honestly: for a 23M-parameter MiniLM, vLLM is unlikely to win on single-request latency and adds a hop. The plausible wins are continuous batching at high offered rates and operating one engine instead of two. Implement behind the existing backend seam and A/B against Candle at matched load; adopt only if it moves ~463/s per replica. | new | LOW-PRIO, FOCUS ON CPU + EMBEDDED? |
+| Recover the trained head's 12.3% | The head costs 12.3% of classification throughput against anchor cosine on saturated arms, and it is worth paying because anchor cosine scored below a constant classifier on 3 of 5 signals. But the cost is one extra matmul on a forward that dominates everything, so it should be recoverable by fusing it into the forward rather than by reverting the decision rule. | new | EXPLORATION/BUGFIX; BENCHMARK? |
 
 **Not planned, and why.** Recording these so they are not proposed again:
 
@@ -136,14 +146,25 @@ rather than the *text*.
 
 ## Phase 3 — Widen the decision
 
-| Work | Notes | Existing issue |
-| --- | --- | --- |
-| Sequence-classification runtime adapter | Hard dependency for everything else in this phase. The 0.1 backend ranks embeddings against anchors and cannot serve a sequence-classification model, which is why such artifacts are deliberately not offered by `hack/fetch-model`. | [#7](https://github.com/llm-d-incubation/llm-d-semantic-classifier/issues/7) |
-| **Domain routing with user-supplied anchors** | The design commitment worth making: **a user should not have to train a model to route their own domains.** Classification here is a thin layer over the embedding — encode the query and a set of labelled anchors, take the class with the highest top-k mean cosine. So accept roughly 20 examples per class as configuration, embed them at startup, and rank at request time. Ranking is microseconds, so the runtime cost is near zero. Offer contrastive fine-tuning as the *upgrade* path for taxonomies where zero-shot anchors are not separable — see Red Hat AI Innovation Team's [Embedding SFT](https://ai-innovation.team/training_hub/#/algorithms/embedding_sft) in `training_hub`, whose canonical use case is exactly semantic routing. | known-gaps, phase 0.4 |
-| Candidate-aware classification and model-affinity scoring | Today the service answers "how complex is this prompt?" in isolation. Routing actually needs "which of *these* candidate models suits this prompt?", which is a different function with a different signature. This is probably the largest single product differentiator available. | [#18](https://github.com/llm-d-incubation/llm-d-semantic-classifier/issues/18) |
-| Multidimensional evaluation | Evaluate on a second axis — candidate model type — rather than label accuracy alone. Required to make the item above assessable; a model-affinity claim cannot be scored by a single-axis accuracy number. | new |
-| Additional decision model families | Gate behind the adapter and a stable backend trait, and require each new family to land with a multidimensional eval row rather than a claim. | new |
-| `ABSTAIN` on insufficient context | The project already publishes a `contested` split: roughly 26–30% of real prompts where three independent jurors do not agree. That is a measured map of where the taxonomy does not resolve. A principled abstention into fallback is better than a confident wrong route. | [#8](https://github.com/llm-d-incubation/llm-d-semantic-classifier/issues/8) |
+| Work | Notes | Existing issue | NOTES |
+| --- | --- | --- | --- |
+| Sequence-classification runtime adapter | Hard dependency for everything else in this phase. The 0.1 backend ranks embeddings against anchors and cannot serve a sequence-classification model, which is why such artifacts are deliberately not offered by `hack/fetch-model`. | [#7](https://github.com/llm-d-incubation/llm-d-semantic-classifier/issues/7) |SHOULD GO TOGETHER WITH MODEL EXPLORATIONS THEME|
+| **Domain routing with user-supplied anchors** | The design commitment worth making: **a user should not have to train a model to route their own domains.** Classification here is a thin layer over the embedding — encode the query and a set of labelled anchors, take the class with the highest top-k mean cosine. So accept roughly 20 examples per class as configuration, embed them at startup, and rank at request time. Ranking is microseconds, so the runtime cost is near zero. Offer contrastive fine-tuning as the *upgrade* path for taxonomies where zero-shot anchors are not separable — see Red Hat AI Innovation Team's [Embedding SFT](https://ai-innovation.team/training_hub/#/algorithms/embedding_sft) in `training_hub`, whose canonical use case is exactly semantic routing. | known-gaps, phase 0.4 | EXCEPT FOR FINE-TUNING WE ALREADY SUPPORT UPDATING ANCHORS SO SPLIT INTO 2 AND MOVE CUSTOM ANCHORS UP? |
+| Candidate-aware classification and model-affinity scoring | Today the service answers "how complex is this prompt?" in isolation. Routing actually needs "which of *these* candidate models suits this prompt?", which is a different function with a different signature. This is probably the largest single product differentiator available. | [#18](https://github.com/llm-d-incubation/llm-d-semantic-classifier/issues/18) | RERANK/MOVE UP: THIS HAS TO DO WITH TARGET USE CASES: Two classes of signal, with different function signatures.
+
+Request-intrinsic — score = f(request). Domain, sensitivity, safety,
+intent, language, modality, and coarse complexity. These stay exactly as they
+are; 0.1 does not become obsolete.
+
+Candidate-conditioned — score = f(request, candidate). Model affinity,
+capability fit, probability of success, tool-use and reasoning suitability.
+
+The Gateway supplies the eligible candidates. llm-d-sc returns per-candidate
+suitability. The Gateway then combines that with cost, policy, data sovereignty,
+endpoint health, capacity, latency and stickiness to select. |
+| Multidimensional evaluation | Evaluate on a second axis — candidate model type — rather than label accuracy alone. Required to make the item above assessable; a model-affinity claim cannot be scored by a single-axis accuracy number. | new | THIS IS JUST MULTIPLE CLASSIFIERS + WEIGHTING, CAN BE DONE AT PRAXIS LEVEL? |
+| Additional decision model families | Gate behind the adapter and a stable backend trait, and require each new family to land with a multidimensional eval row rather than a claim. | new | LOW PRIORITY, FOCUS ON FEW MODEL FAMILIES AT FIRST, GROUP WITH VLLM EXPLORATION |
+| `ABSTAIN` on insufficient context | The project already publishes a `contested` split: roughly 26–30% of real prompts where three independent jurors do not agree. That is a measured map of where the taxonomy does not resolve. A principled abstention into fallback is better than a confident wrong route. | [#8](https://github.com/llm-d-incubation/llm-d-semantic-classifier/issues/8) |OK|
 
 **Exit criteria**
 
@@ -157,12 +178,12 @@ rather than the *text*.
 
 ## Phase 4 — Integration depth
 
-| Work | Notes |
-| --- | --- |
-| Session identity and turn accounting at the gateway | The classification half of this lands in Phase 2 as a throughput lever. What remains here is the gateway contract: who owns session identity, how turns are counted across a conversation, and how a mid-session re-classification is signalled so routing does not flap. |
-| Explicit fallback contract | Fail-open is currently emergent behaviour discovered in a benchmark. It should be a configurable, documented policy that emits a signal when it engages. |
-| Infrastructure-aware routing | Accept queue-depth and KV-cache-pressure signals so tier selection and pod selection compose rather than compete. |
-| Decision cache sharing | Gateway and classifier cache independently today. A shared decision cache across gateway replicas raises the effective hit rate, and the hit rate is the knee. |
+| Work | Notes | REVIEW NOTES |
+| --- | --- | --- |
+| Session identity and turn accounting at the gateway | The classification half of this lands in Phase 2 as a throughput lever. What remains here is the gateway contract: who owns session identity, how turns are counted across a conversation, and how a mid-session re-classification is signalled so routing does not flap. | MIGHT BE WORTH JOINING ON THE SAME PHASE? |
+| Explicit fallback contract | Fail-open is currently emergent behaviour discovered in a benchmark. It should be a configurable, documented policy that emits a signal when it engages. | OK |
+| Infrastructure-aware routing | Accept queue-depth and KV-cache-pressure signals so tier selection and pod selection compose rather than compete. | SHOULD BE DONE IN THE GATEWAY |
+| Decision cache sharing | Gateway and classifier cache independently today. A shared decision cache across gateway replicas raises the effective hit rate, and the hit rate is the knee. | OK FUTURE WORK |
 
 **Exit criteria**
 
