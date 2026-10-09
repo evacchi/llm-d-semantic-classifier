@@ -14,15 +14,15 @@ The project supports two distinct classification workloads. They have different
 contracts, ownership boundaries, and optimization goals, so the roadmap keeps
 them separate.
 
-### Zero/one-shot classification: always classify
+### First-turn classification: always classify
 
-The primary near-term workload is request-intrinsic classification over an
-unordered domain of labels. For every eligible request, `llm-d-sc` should
+The primary near-term workload is request-intrinsic classification over a 
+domain of labels. For every eligible request, `llm-d-sc` should
 produce a classification (or an explicit low-confidence/abstention result).
 Examples include domain, sensitivity, safety, intent, language, modality, and
 coarse complexity.
 
-This is the natural home for anchor-based engineering. A user supplies or
+This is the natural home for configurable anchors. A user supplies or
 updates labelled anchors; the service embeds them and ranks a request against
 the configured label set. It should work without retraining, use small
 CPU-friendly models, and build first on model types and implementations that
@@ -36,12 +36,11 @@ sovereignty, endpoint health, capacity, latency, and stickiness.
 
 ### Multi-turn classification: classify when needed
 
-The second workload is classification over an ordered set of labels or states
-across a conversation. It should not run blindly on every turn. The Gateway
-owns session identity, turn accounting, and routing state; it asks for a
-reclassification when a material change is detected or policy requires it—for
-example, a change in saturation, flow-control state, or another routing-relevant
-conversation signal.
+The second workload is multi-turn classification over an set of labels. 
+It should not run blindly on every turn. The Gateway owns session identity, 
+turn accounting, and routing state; it asks for a reclassification when a 
+material change is detected or policy requires it—for example, a change in saturation, 
+flow-control state, or another routing-relevant conversation signal.
 
 This avoids treating session state as an implementation detail of a stateless
 classifier. The classifier supplies scores and a stable contract; the Gateway
@@ -125,11 +124,11 @@ evidence-led, and every promoted artifact has a traceable evaluation record.
 
 ---
 
-## Workstream 3 — Always-classify zero/one-shot domains
+## Workstream 3 — Always-classify first-turn domains
 
 Build the primary product path around small supported models and configurable
-anchors. The label set is unordered and classification is attempted for every
-eligible request. The service must make uncertainty explicit rather than
+anchors. Classification is attempted for every eligible request. 
+The service must make uncertainty explicit rather than
 silently converting it to a routing decision.
 
 | Work | Outcome | Existing issue |
@@ -145,7 +144,7 @@ the Praxis/Gateway layer where appropriate. `llm-d-sc` should expose clear,
 independently evaluable scores rather than take ownership of policy and final
 routing selection.
 
-**Success criteria:** a user can configure an unordered domain label set with
+**Success criteria:** a user can configure a domain label set with
 anchors, receive a classification for each eligible request, and see an
 explicit, observable uncertainty result when it cannot be resolved.
 
@@ -153,9 +152,9 @@ explicit, observable uncertainty result when it cannot be resolved.
 
 ## Workstream 4 — Multi-turn, conditional classification
 
-This workstream is jointly defined with the Gateway. It models ordered labels
+This workstream is jointly defined with the Gateway. It models labels
 or states over time and invokes classification only when needed—not as a
-per-turn replacement for zero/one-shot classification.
+per-turn replacement for first-turn classification.
 
 | Work | Outcome |
 | --- | --- |
